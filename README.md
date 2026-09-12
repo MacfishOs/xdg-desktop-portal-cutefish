@@ -1,6 +1,7 @@
 # xdg-desktop-portal-cutefish
 
-A Qt 6 backend for `xdg-desktop-portal`. The first supported interface is
+A Qt 6 backend for `xdg-desktop-portal`, providing Settings and FileChooser.
+The Settings interface is
 `org.freedesktop.impl.portal.Settings`, version 1, exposing
 `org.freedesktop.appearance/color-scheme` as a D-Bus `uint32`:
 
@@ -11,7 +12,44 @@ A Qt 6 backend for `xdg-desktop-portal`. The first supported interface is
 
 The backend implements `Read`, namespace-filtered `ReadAll`, and
 `SettingChanged`, following the [Settings backend specification](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.impl.portal.Settings.html).
-It has no GUI and depends only on Qt Core and Qt D-Bus, with no KDE libraries.
+The backend depends on Qt Core and Qt D-Bus.
+File chooser UI runs in File Manager's separate `cutefish-filechooser` process.
+
+## File chooser
+
+`org.freedesktop.impl.portal.FileChooser` implements `OpenFile`, `SaveFile`, and
+`SaveFiles`. It delegates each request to `/usr/libexec/cutefish-filechooser`, built
+and installed by the sibling `filemanager` project. The dialog uses File Manager's
+folder and places models and FishUI appearance, without opening a browser window.
+
+Supported features include file/folder selection, multiple selection, path
+navigation, mounted places, hidden files, glob and MIME filters, custom choices,
+suggested names/locations, and overwrite confirmation. `SaveFiles` selects a
+destination folder and returns unused names for collisions. The chooser never
+writes the selected save file; the requesting application performs the save.
+
+Requests run asynchronously and independently. Closing a portal request kills its
+dialog and returns cancellation. Helper launch/crash/protocol failures return
+response `2`; only successful, local `file://` URIs are forwarded. The portal
+frontend handles sandbox access and document export.
+
+X11 parent identifiers attach the dialog to its requesting window. Wayland foreign
+parent handles are not yet attached, so the dialog opens as a separate window on
+Wayland; cross-process modality is not enforced there. Non-local locations such as
+Trash are excluded. Native filenames must be representable as Unicode for the
+private JSON protocol.
+
+Build/install both `filemanager` and this project, then restart the backend and
+frontend to load the new executable and portal metadata:
+
+```sh
+systemctl --user restart xdg-desktop-portal-cutefish.service
+systemctl --user restart xdg-desktop-portal.service
+```
+
+For development, `--file-chooser-helper /path/to/cutefish-filechooser` selects a
+built helper without installing it. See `filemanager/chooser/README.md` for UI
+build instructions and the private helper protocol.
 
 ## How updates reach applications
 
@@ -66,8 +104,8 @@ restart, duplicate process rejection, and forwarding through the portal frontend
 
 ## Install and activate
 
-Runtime requirements are Qt 6 Core/DBus, `xdg-desktop-portal`, and
-`cutefish-services`. Install `xdg-desktop-portal-gtk` for the other portal interfaces
+Runtime requirements are Qt 6 Core/DBus, `xdg-desktop-portal`, `cutefish-services`,
+and File Manager's `cutefish-filechooser` helper. Install `xdg-desktop-portal-gtk` for the other portal interfaces
 selected by the supplied fallback configuration.
 
 ```sh
@@ -98,7 +136,7 @@ systemctl --user restart xdg-desktop-portal.service
 
 The activation environment must contain `XDG_CURRENT_DESKTOP=Cutefish`, which
 Cutefish's session script already exports. The supplied desktop-specific
-configuration selects Cutefish for Settings and GTK for other interfaces.
+configuration selects Cutefish for Settings and FileChooser, and GTK for other interfaces.
 Existing higher-priority user configurations may override this selection; see
 [portals.conf](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html).
 

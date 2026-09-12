@@ -13,10 +13,14 @@ add_executable(xdg-desktop-portal-cutefish
     src/main.cpp
     src/settingsportal.cpp
     src/settingsportal.h
+    src/filechooserportal.cpp
+    src/filechooserportal.h
+    src/filechoosertypes.h
 )
 target_link_libraries(xdg-desktop-portal-cutefish PRIVATE Qt6::Core Qt6::DBus)
 target_compile_definitions(xdg-desktop-portal-cutefish PRIVATE
     PROJECT_VERSION="${PROJECT_VERSION}"
+    FILE_CHOOSER_HELPER="${CMAKE_INSTALL_FULL_LIBEXECDIR}/cutefish-filechooser"
 )
 
 configure_file(data/org.freedesktop.impl.portal.desktop.cutefish.service.in

@@ -1,3 +1,4 @@
+#include "filechooserportal.h"
 #include "settingsportal.h"
 
 #include <QCommandLineParser>
@@ -12,7 +13,10 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationVersion(QStringLiteral(PROJECT_VERSION));
 
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("Cutefish Settings portal backend"));
+    parser.setApplicationDescription(QStringLiteral("Cutefish desktop portal backend"));
+    parser.addOption({QStringLiteral("file-chooser-helper"),
+                      QStringLiteral("File Manager chooser executable"), QStringLiteral("path"),
+                      QStringLiteral(FILE_CHOOSER_HELPER)});
     parser.addHelpOption();
     parser.addVersionOption();
     parser.process(app);
@@ -27,9 +31,11 @@ int main(int argc, char *argv[])
                 QStringLiteral("Disconnected"), &app, SLOT(quit()));
 
     SettingsPortal settings(bus);
+    new FileChooserPortal(&settings, bus, parser.value(QStringLiteral("file-chooser-helper")));
     if (!bus.registerObject(QStringLiteral("/org/freedesktop/portal/desktop"), &settings,
                             QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals
-                                    | QDBusConnection::ExportAllProperties)) {
+                                    | QDBusConnection::ExportAllProperties
+                                    | QDBusConnection::ExportAdaptors)) {
         qCritical() << "Cannot export the Settings portal:" << bus.lastError();
         return 1;
     }
