@@ -33,9 +33,9 @@ dialog and returns cancellation. Helper launch/crash/protocol failures return
 response `2`; only successful, local `file://` URIs are forwarded. The portal
 frontend handles sandbox access and document export.
 
-X11 parent identifiers attach the dialog to its requesting window. Wayland foreign
-parent handles are not yet attached, so the dialog opens as a separate window on
-Wayland; cross-process modality is not enforced there. Non-local locations such as
+X11 parent identifiers attach the dialog to its requesting window, and Wayland
+`wayland:<handle>` identifiers are imported through `xdg-foreign-unstable-v2`,
+which parents the dialog and makes it modal. Non-local locations such as
 Trash are excluded. Native filenames must be representable as Unicode for the
 private JSON protocol.
 
