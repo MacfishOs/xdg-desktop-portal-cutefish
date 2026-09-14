@@ -1,4 +1,5 @@
 #include "filechooserportal.h"
+#include "inhibitportal.h"
 #include "settingsportal.h"
 
 #include <QCommandLineParser>
@@ -31,6 +32,7 @@ int main(int argc, char *argv[])
                 QStringLiteral("Disconnected"), &app, SLOT(quit()));
 
     SettingsPortal settings(bus);
+    new InhibitPortal(&settings, bus);
     new FileChooserPortal(&settings, bus, parser.value(QStringLiteral("file-chooser-helper")));
     if (!bus.registerObject(QStringLiteral("/org/freedesktop/portal/desktop"), &settings,
                             QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals

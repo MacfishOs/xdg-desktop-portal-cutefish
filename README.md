@@ -1,6 +1,6 @@
 # xdg-desktop-portal-cutefish
 
-A Qt 6 backend for `xdg-desktop-portal`, providing Settings and FileChooser.
+A Qt 6 backend for `xdg-desktop-portal`, providing Settings, FileChooser, and idle inhibition.
 The Settings interface is
 `org.freedesktop.impl.portal.Settings`, version 1, exposing
 `org.freedesktop.appearance/color-scheme` as a D-Bus `uint32`:
@@ -50,6 +50,23 @@ systemctl --user restart xdg-desktop-portal.service
 For development, `--file-chooser-helper /path/to/cutefish-filechooser` selects a
 built helper without installing it. See `filemanager/chooser/README.md` for UI
 build instructions and the private helper protocol.
+
+## Idle inhibition
+
+`org.freedesktop.impl.portal.Inhibit.Inhibit` supports the Idle flag (`8`),
+forwarding the application ID and reason to the compositor's
+`org.freedesktop.ScreenSaver.Inhibit`. Each exported request owns one cookie.
+`Request.Close` or caller disconnection releases it, including when a request
+is closed before the ScreenSaver reply arrives. Only the requesting connection
+may close a request. ScreenSaver failures are returned as D-Bus errors.
+
+Logout, user switching, suspend, combined flags, and session monitoring are not
+implemented. Unsupported flags return `org.freedesktop.portal.Error.NotSupported`.
+This backend follows the [Inhibit backend interface](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.impl.portal.Inhibit.html).
+The compositor must include ScreenSaver inhibition support.
+
+The inhibition tests use a private bus and mock ScreenSaver service to check
+cookie lifetimes, ownership, cancellation during acquisition, and error handling.
 
 ## How updates reach applications
 
@@ -136,7 +153,7 @@ systemctl --user restart xdg-desktop-portal.service
 
 The activation environment must contain `XDG_CURRENT_DESKTOP=Cutefish`, which
 Cutefish's session script already exports. The supplied desktop-specific
-configuration selects Cutefish for Settings and FileChooser, and GTK for other interfaces.
+configuration selects Cutefish for Settings, FileChooser, and Inhibit, and GTK for other interfaces.
 Existing higher-priority user configurations may override this selection; see
 [portals.conf](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html).
 

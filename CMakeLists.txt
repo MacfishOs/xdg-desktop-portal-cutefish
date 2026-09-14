@@ -11,6 +11,8 @@ find_package(Qt6 REQUIRED COMPONENTS Core DBus)
 
 add_executable(xdg-desktop-portal-cutefish
     src/main.cpp
+    src/inhibitportal.cpp
+    src/inhibitportal.h
     src/settingsportal.cpp
     src/settingsportal.h
     src/filechooserportal.cpp
@@ -53,4 +55,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_settings.py
             $<TARGET_FILE:xdg-desktop-portal-cutefish>)
     set_tests_properties(settings-portal PROPERTIES TIMEOUT 60)
+    add_test(NAME inhibit-portal
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_session.py
+            ${DBUS_RUN_SESSION} ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_inhibit.py
+            $<TARGET_FILE:xdg-desktop-portal-cutefish>)
+    set_tests_properties(inhibit-portal PROPERTIES TIMEOUT 60)
 endif()
