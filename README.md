@@ -1,6 +1,7 @@
 # xdg-desktop-portal-cutefish
 
-A Qt 6 backend for `xdg-desktop-portal`, providing Settings, FileChooser, and idle inhibition.
+A Qt 6 backend for `xdg-desktop-portal`, providing Settings, FileChooser, idle
+inhibition, and ScreenCast.
 The Settings interface is
 `org.freedesktop.impl.portal.Settings`, version 1, exposing
 `org.freedesktop.appearance/color-scheme` as a D-Bus `uint32`:
@@ -68,6 +69,80 @@ The compositor must include ScreenSaver inhibition support.
 The inhibition tests use a private bus and mock ScreenSaver service to check
 cookie lifetimes, ownership, cancellation during acquisition, and error handling.
 
+## Screen cast
+
+`org.freedesktop.impl.portal.ScreenCast` (version 4) lets applications share a
+monitor through PipeWire: OBS, Chromium and Electron applications, Firefox, and
+screen sharing in Discord, Zoom or Meet all go through this interface.
+
+```text
+application → xdg-desktop-portal (ScreenCast, OpenPipeWireRemote)
+            → xdg-desktop-portal-cutefish
+                 ├─ com.cutefish.Services.Permissions.Prompt   (the dialog)
+                 ├─ ext-image-copy-capture-v1 → cutefish-compositor (frames)
+                 └─ PipeWire Video/Source node                 (to the app)
+```
+
+No new Wayland protocol is involved: the backend is an ordinary client of the
+compositor's `ext-image-capture-source-v1` / `ext-image-copy-capture-v1`
+implementation, the same one `cutefish-screenshot` uses. The compositor only
+announces those globals to allowlisted executables, and it allowlists this
+backend at its installed path, so a build-tree backend cannot capture a live
+session.
+
+Each stream is one PipeWire `Video/Source` node. Buffers are memfd-backed
+`wl_shm` buffers handed to PipeWire as `MemFd` data (`BGRA`, with `BGRx`
+offered for consumers that ignore alpha) at the output's pixel size, with a
+variable frame rate capped at the output's refresh rate and at whatever the
+consumer negotiates. Frames carry `Header` (presentation time from the
+compositor, sequence number) and `VideoTransform` metadata; a frame is only
+requested while a PipeWire buffer is free, and the throttle is one capture per
+frame period. Output size changes renegotiate the stream; output removal or a
+compositor disconnect closes the session, which the frontend sees as
+`Session.Closed`.
+
+Supported: `MONITOR` sources (`AvailableSourceTypes` = 1), one monitor per
+session, `Hidden` and `Embedded` cursor modes (`AvailableCursorModes` = 3),
+`persist_mode` and `restore_data` (vendor `Cutefish`, version 1, `monitors`).
+Not supported: window and virtual sources, cursor metadata, DMA-BUF buffers,
+and damage metadata; consumers receive full frames.
+
+### Permission
+
+`Start` asks the user through `cutefish-services`
+(`com.cutefish.Services.Permissions.Prompt`, kind `screen-recording`), which
+shows the requesting application, the displays to choose from, and Deny,
+Allow Once and Always Allow. The decision is recorded in
+`~/.config/cutefish/privacy.conf` through the framework's
+`ScreenRecordingPermissions`:
+
+- every application that has asked is listed, so Settings › Privacy can grant
+  or revoke it later;
+- Always Allow stores the grant and the chosen monitors, and the next `Start`
+  from that application streams without a prompt as long as the monitors still
+  exist (a single monitor is chosen automatically);
+- an application's own `restore_data` is honoured only while its grant stands,
+  and `persist_mode`/`restore_data` are only returned after Always Allow;
+- Deny closes the request with response 1, and the frontend closes the session.
+
+Applications without an app id (unsandboxed programs the frontend cannot
+identify) get Deny and Allow Once only.
+
+The request handle accepts `Close` while the prompt is open, which dismisses
+it. The session object implements `org.freedesktop.impl.portal.Session`
+(`Close`, `Closed`, `version`); `Close` from the frontend or the frontend
+leaving the bus stops the streams.
+
+### Runtime requirements
+
+PipeWire must be running in the session (the frontend also needs it for
+`OpenPipeWireRemote`), `cutefish-services` must be on the bus for the prompt,
+and the compositor must be one that allowlists this backend, which
+`cutefish-compositor` does once both are installed under the same prefix.
+`WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` must be in the D-Bus activation
+environment, which the Cutefish session exports. Without a reachable compositor
+or capture globals, `Start` fails with response 2.
+
 ## How updates reach applications
 
 ```text
@@ -97,8 +172,11 @@ their existing GTK settings-file handling.
 
 ## Build and test
 
-Build requirements: CMake 3.18+, a C++17 compiler, and Qt 6 Core/DBus development
-packages. Tests additionally require `dbus-run-session`, Python 3, and GObject/GIO
+Build requirements: CMake 3.18+, a C++17 compiler, Qt 6 Core/DBus development
+packages, `libpipewire-0.3`, `wayland-client`, `wayland-scanner` and
+`wayland-protocols` 1.39+, and the sibling `cutefish-framework` checkout (the
+permission store is built from `../cutefish-framework/privacy`). Tests
+additionally require `dbus-run-session`, Python 3, and GObject/GIO
 bindings (`python3-gi` on Debian). An installed `xdg-desktop-portal` enables the
 frontend forwarding test.
 
@@ -118,11 +196,14 @@ session bus with temporary settings and a mock Cutefish appearance service; they
 do not change the running desktop's theme. They cover initial values, D-Bus types,
 filters, errors, live notifications, duplicate suppression, late startup, service
 restart, duplicate process rejection, and forwarding through the portal frontend.
+The screen cast test covers session ownership and lifetime, `SelectSources`
+validation and `Closed`, and a `Start` that fails cleanly without a compositor;
+streaming itself is verified against a live session.
 
 ## Install and activate
 
 Runtime requirements are Qt 6 Core/DBus, `xdg-desktop-portal`, `cutefish-services`,
-and File Manager's `cutefish-filechooser` helper. Install `xdg-desktop-portal-gtk` for the other portal interfaces
+PipeWire, and File Manager's `cutefish-filechooser` helper. Install `xdg-desktop-portal-gtk` for the other portal interfaces
 selected by the supplied fallback configuration.
 
 ```sh
@@ -153,7 +234,8 @@ systemctl --user restart xdg-desktop-portal.service
 
 The activation environment must contain `XDG_CURRENT_DESKTOP=Cutefish`, which
 Cutefish's session script already exports. The supplied desktop-specific
-configuration selects Cutefish for Settings, FileChooser, and Inhibit, and GTK for other interfaces.
+configuration selects Cutefish for Settings, FileChooser, Inhibit, and ScreenCast,
+and GTK for other interfaces.
 Existing higher-priority user configurations may override this selection; see
 [portals.conf](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html).
 

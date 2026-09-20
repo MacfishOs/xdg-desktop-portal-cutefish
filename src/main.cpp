@@ -1,5 +1,6 @@
 #include "filechooserportal.h"
 #include "inhibitportal.h"
+#include "screencastportal.h"
 #include "settingsportal.h"
 
 #include <QCommandLineParser>
@@ -34,6 +35,7 @@ int main(int argc, char *argv[])
     SettingsPortal settings(bus);
     new InhibitPortal(&settings, bus);
     new FileChooserPortal(&settings, bus, parser.value(QStringLiteral("file-chooser-helper")));
+    new ScreenCastPortal(&settings, bus);
     if (!bus.registerObject(QStringLiteral("/org/freedesktop/portal/desktop"), &settings,
                             QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals
                                     | QDBusConnection::ExportAllProperties

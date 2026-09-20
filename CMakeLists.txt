@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(xdg-desktop-portal-cutefish VERSION 0.1.0 LANGUAGES CXX)
+project(xdg-desktop-portal-cutefish VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,6 +8,32 @@ set(CMAKE_AUTOMOC ON)
 
 include(GNUInstallDirs)
 find_package(Qt6 REQUIRED COMPONENTS Core DBus)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PipeWire REQUIRED IMPORTED_TARGET libpipewire-0.3)
+pkg_check_modules(WaylandClient REQUIRED IMPORTED_TARGET wayland-client)
+pkg_check_modules(WaylandProtocols REQUIRED wayland-protocols>=1.39)
+pkg_get_variable(WAYLAND_PROTOCOLS_DATADIR wayland-protocols pkgdatadir)
+pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
+
+# The permission store is shared with Settings through the sibling framework
+# checkout, as in the other desktop components.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../cutefish-framework/privacy
+                 ${CMAKE_CURRENT_BINARY_DIR}/cutefish-framework-privacy-build)
+
+# Client-side marshalling for the capture protocols; generated into the build tree.
+set(PROTOCOL_DIR ${CMAKE_BINARY_DIR}/wayland-protocols)
+file(MAKE_DIRECTORY ${PROTOCOL_DIR})
+function(portal_wayland_protocol target name directory)
+    set(xml ${WAYLAND_PROTOCOLS_DATADIR}/${directory}/${name}.xml)
+    add_custom_command(OUTPUT ${PROTOCOL_DIR}/${name}-protocol.c
+        COMMAND ${WAYLAND_SCANNER} private-code ${xml} ${PROTOCOL_DIR}/${name}-protocol.c
+        DEPENDS ${xml} VERBATIM)
+    add_custom_command(OUTPUT ${PROTOCOL_DIR}/${name}-client-protocol.h
+        COMMAND ${WAYLAND_SCANNER} client-header ${xml} ${PROTOCOL_DIR}/${name}-client-protocol.h
+        DEPENDS ${xml} VERBATIM)
+    target_sources(${target} PRIVATE
+        ${PROTOCOL_DIR}/${name}-protocol.c ${PROTOCOL_DIR}/${name}-client-protocol.h)
+endfunction()
 
 add_executable(xdg-desktop-portal-cutefish
     src/main.cpp
@@ -18,8 +44,25 @@ add_executable(xdg-desktop-portal-cutefish
     src/filechooserportal.cpp
     src/filechooserportal.h
     src/filechoosertypes.h
+    src/pipewirecore.cpp
+    src/pipewirecore.h
+    src/screencastportal.cpp
+    src/screencastportal.h
+    src/screencaststream.cpp
+    src/screencaststream.h
+    src/screencasttypes.h
+    src/waylandcapture.cpp
+    src/waylandcapture.h
 )
-target_link_libraries(xdg-desktop-portal-cutefish PRIVATE Qt6::Core Qt6::DBus)
+portal_wayland_protocol(xdg-desktop-portal-cutefish ext-image-capture-source-v1 staging/ext-image-capture-source)
+portal_wayland_protocol(xdg-desktop-portal-cutefish ext-image-copy-capture-v1 staging/ext-image-copy-capture)
+# The capture source manager's toplevel request references this interface at
+# link time; no window capture is requested.
+portal_wayland_protocol(xdg-desktop-portal-cutefish ext-foreign-toplevel-list-v1 staging/ext-foreign-toplevel-list)
+portal_wayland_protocol(xdg-desktop-portal-cutefish xdg-output-unstable-v1 unstable/xdg-output)
+target_include_directories(xdg-desktop-portal-cutefish PRIVATE ${PROTOCOL_DIR})
+target_link_libraries(xdg-desktop-portal-cutefish PRIVATE Qt6::Core Qt6::DBus
+    PkgConfig::PipeWire PkgConfig::WaylandClient Cutefish::Privacy)
 target_compile_definitions(xdg-desktop-portal-cutefish PRIVATE
     PROJECT_VERSION="${PROJECT_VERSION}"
     FILE_CHOOSER_HELPER="${CMAKE_INSTALL_FULL_LIBEXECDIR}/cutefish-filechooser"
@@ -49,16 +92,12 @@ if(BUILD_TESTING)
     if(NOT PYTHON_GIO_RESULT EQUAL 0)
         message(FATAL_ERROR "Tests require Python GObject/GIO bindings (python3-gi on Debian). Use -DPython3_EXECUTABLE=/usr/bin/python3 or -DBUILD_TESTING=OFF.")
     endif()
-    add_test(NAME settings-portal
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_session.py
-            ${DBUS_RUN_SESSION} ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_settings.py
-            $<TARGET_FILE:xdg-desktop-portal-cutefish>)
-    set_tests_properties(settings-portal PROPERTIES TIMEOUT 60)
-    add_test(NAME inhibit-portal
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_session.py
-            ${DBUS_RUN_SESSION} ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_inhibit.py
-            $<TARGET_FILE:xdg-desktop-portal-cutefish>)
-    set_tests_properties(inhibit-portal PROPERTIES TIMEOUT 60)
+    foreach(test settings inhibit screencast)
+        add_test(NAME ${test}-portal
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_session.py
+                ${DBUS_RUN_SESSION} ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${test}.py
+                $<TARGET_FILE:xdg-desktop-portal-cutefish>)
+        set_tests_properties(${test}-portal PROPERTIES TIMEOUT 60)
+    endforeach()
 endif()
