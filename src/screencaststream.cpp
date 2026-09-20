@@ -87,6 +87,7 @@ const pw_stream_events streamEvents = [] {
 
 constexpr int bytesPerPixel = 4;
 constexpr int damageRegions = 16;
+constexpr int dmabufFailureLimit = 3;
 
 // ARGB8888 little-endian memory order is what SPA calls BGRA.
 spa_video_format spaFormat(uint32_t drmFormat)
@@ -378,7 +379,7 @@ void ScreenCastStream::handleStateChanged(int previous, int state, const char *e
         m_streaming = false;
         m_throttle.stop();
         if (m_current)
-            returnCurrent(true);
+            returnCurrent();
         if (!m_announced && pw_stream_get_node_id(m_stream) != SPA_ID_INVALID) {
             m_nodeId = pw_stream_get_node_id(m_stream);
             m_announced = true;
@@ -674,7 +675,7 @@ void ScreenCastStream::beginCapture()
     if (entry && entry->filled)
         damage.append(entry->missed.isValid() ? entry->missed : QRect(0, 0, 0, 0));
     if (!entry || !entry->wlBuffer || !m_session->capture(entry->wlBuffer, damage))
-        returnCurrent(true);
+        returnCurrent();
 }
 
 void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform,
@@ -682,6 +683,7 @@ void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform,
 {
     if (!m_current)
         return;
+    m_failures = 0;
     spa_buffer *buffer = m_current->buffer;
     if (auto *header = static_cast<spa_meta_header *>(
                 spa_buffer_find_meta_data(buffer, SPA_META_Header, sizeof(spa_meta_header)))) {
@@ -741,21 +743,32 @@ void ScreenCastStream::frameFailed(uint32_t reason)
         finish();
         return;
     }
-    returnCurrent(true);
+    returnCurrent();
     // A discarded frame or a stale buffer size is transient; renegotiation, if
-    // any, arrives through the session constraints.
+    // any, arrives through the session constraints. Nothing but the buffers
+    // is different on the DMA-BUF path, so failing every capture there means
+    // the compositor cannot render into them after all.
+    if (m_dmabuf && ++m_failures >= dmabufFailureLimit) {
+        qWarning() << "The compositor keeps failing DMA-BUF captures for" << m_target.name
+                   << "(reason" << reason << "); falling back to memory";
+        m_avoidDmaBuf = true;
+        updateParams();
+        return;
+    }
     m_throttle.start(1000 / std::max(m_framerate, 1));
 }
 
-void ScreenCastStream::returnCurrent(bool corrupted)
+// Hands an unfilled buffer back for the next dequeue. Queuing it instead
+// would submit it as output: with the stream driving the graph nothing
+// consumes it until the next trigger, and after enough failures every buffer
+// sits in that queue and none can be dequeued.
+void ScreenCastStream::returnCurrent()
 {
     if (!m_current)
         return;
     if (m_session)
         m_session->cancel();
-    m_current->buffer->datas[0].chunk->flags =
-            corrupted ? SPA_CHUNK_FLAG_CORRUPTED : SPA_CHUNK_FLAG_NONE;
-    pw_stream_queue_buffer(m_stream, m_current);
+    pw_stream_return_buffer(m_stream, m_current);
     m_current = nullptr;
 }
 

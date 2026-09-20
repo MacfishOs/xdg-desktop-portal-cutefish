@@ -76,7 +76,7 @@ private:
     void beginCapture();
     void frameReady(uint64_t presentationNs, uint32_t transform, const QList<QRect> &damage);
     void frameFailed(uint32_t reason);
-    void returnCurrent(bool corrupted);
+    void returnCurrent();
     void destroyStream();
     void finish();
 
@@ -105,6 +105,9 @@ private:
     gbm_device *m_gbm = nullptr;
     bool m_avoidDmaBuf = false;
     bool m_dmabuf = false;
+    // Captures the compositor failed in a row; enough of them on DMA-BUFs
+    // withdraws the offer, since the probe only proved a 16x16 render.
+    int m_failures = 0;
     uint32_t m_drmFormat = 0;
     uint64_t m_modifier = 0;
     // Set by chooseModifier() while a DONT_FIXATE choice is being fixated.
