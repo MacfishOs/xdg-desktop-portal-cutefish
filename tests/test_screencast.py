@@ -70,7 +70,7 @@ class ScreenCastPortalTest(unittest.TestCase):
         values = self.call("org.freedesktop.DBus.Properties", "GetAll",
                            GLib.Variant("(s)", (INTERFACE,))).unpack()[0]
         self.assertEqual(values["version"], 4)
-        self.assertEqual(values["AvailableSourceTypes"], 1)
+        self.assertEqual(values["AvailableSourceTypes"], 3)
         self.assertEqual(values["AvailableCursorModes"], 3)
 
     def test_session_lifecycle(self):
@@ -112,9 +112,12 @@ class ScreenCastPortalTest(unittest.TestCase):
 
     def test_select_sources_validation(self):
         self.create("types")
-        self.assertEqual(self.select("types", {"types": GLib.Variant("u", 2)}).unpack()[0], 2)
+        # Virtual sources alone are refused; monitors or windows are fine.
+        self.assertEqual(self.select("types", {"types": GLib.Variant("u", 4)}).unpack()[0], 2)
         spin_until(lambda: self.closed == [SESSION + "types"])
         self.assertFalse(self.exists("types"))
+        self.create("windows")
+        self.assertEqual(self.select("windows", {"types": GLib.Variant("u", 2)}).unpack()[0], 0)
 
         self.create("cursor")
         self.assertEqual(self.select("cursor", {"cursor_mode": GLib.Variant("u", 4)}).unpack()[0], 2)

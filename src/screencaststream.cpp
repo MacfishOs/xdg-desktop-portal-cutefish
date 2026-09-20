@@ -4,21 +4,43 @@
 #include "waylandcapture.h"
 
 #include <QDebug>
+#include <QDir>
+#include <QDirIterator>
+#include <QFile>
 
 #include <algorithm>
+#include <drm_fourcc.h>
 #include <ext-image-copy-capture-v1-client-protocol.h>
 #include <fcntl.h>
+#include <gbm.h>
 #include <pipewire/pipewire.h>
 #include <spa/buffer/meta.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/pod/builder.h>
+#include <spa/pod/dynamic.h>
 #include <spa/utils/result.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <wayland-client-protocol.h>
 
 struct ScreenCastStream::Buffer {
+    // memfd-backed wl_shm buffers own one fd; DMA-BUFs own the bo and one
+    // exported fd per plane.
     int fd = -1;
+    gbm_bo *bo = nullptr;
+    std::vector<int> planeFds;
     wl_buffer *wlBuffer = nullptr;
+    // The bounding box of what changed since this buffer was last filled,
+    // for damage_buffer; the compositor paints whole frames, so a box is
+    // as good as the exact region here.
+    QRect missed;
+    bool filled = false;
+    // DMA-BUF import is asynchronous; a capture waits for it, a refusal
+    // withdraws DMA-BUFs from the stream.
+    bool importPending = false;
+    bool importFailed = false;
+    std::shared_ptr<bool> alive = std::make_shared<bool>(true);
 };
 
 struct ScreenCastStreamEvents {
@@ -64,16 +86,55 @@ const pw_stream_events streamEvents = [] {
 }();
 
 constexpr int bytesPerPixel = 4;
+constexpr int damageRegions = 16;
+
+// ARGB8888 little-endian memory order is what SPA calls BGRA.
+spa_video_format spaFormat(uint32_t drmFormat)
+{
+    switch (drmFormat) {
+    case DRM_FORMAT_ARGB8888:
+        return SPA_VIDEO_FORMAT_BGRA;
+    case DRM_FORMAT_XRGB8888:
+        return SPA_VIDEO_FORMAT_BGRx;
+    default:
+        return SPA_VIDEO_FORMAT_UNKNOWN;
+    }
+}
+
+uint32_t drmFormat(spa_video_format format)
+{
+    switch (format) {
+    case SPA_VIDEO_FORMAT_BGRA:
+        return DRM_FORMAT_ARGB8888;
+    case SPA_VIDEO_FORMAT_BGRx:
+        return DRM_FORMAT_XRGB8888;
+    default:
+        return DRM_FORMAT_INVALID;
+    }
+}
+
+// The DRM node with this st_rdev, which is what the compositor names.
+QString drmNodeFor(dev_t device)
+{
+    QDirIterator nodes(QStringLiteral("/dev/dri"), QDir::System | QDir::Files);
+    while (nodes.hasNext()) {
+        const QString path = nodes.next();
+        struct stat info = {};
+        if (stat(QFile::encodeName(path).constData(), &info) == 0 && info.st_rdev == device)
+            return path;
+    }
+    return {};
+}
 
 } // namespace
 
 ScreenCastStream::ScreenCastStream(WaylandCapture *wayland, PipeWireCore *pipewire,
-                                   const QString &output, bool cursor, int maxFramerate,
+                                   const CaptureTarget &target, bool cursor, int maxFramerate,
                                    QObject *parent)
     : QObject(parent)
     , m_wayland(wayland)
     , m_pipewire(pipewire)
-    , m_output(output)
+    , m_target(target)
     , m_cursor(cursor)
     , m_maxFramerate(std::clamp(maxFramerate, 1, 240))
 {
@@ -99,6 +160,10 @@ ScreenCastStream::~ScreenCastStream()
     if (m_session)
         m_session->cancel();
     destroyStream();
+    if (m_gbm)
+        gbm_device_destroy(m_gbm);
+    if (m_gbmFd >= 0)
+        close(m_gbmFd);
 }
 
 void ScreenCastStream::destroyStream()
@@ -116,7 +181,9 @@ bool ScreenCastStream::start()
 {
     if (!m_wayland->connectToDisplay() || !m_pipewire->connectToDaemon())
         return false;
-    m_session = m_wayland->createSession(m_output, m_cursor);
+    m_session = m_target.kind == CaptureTarget::Kind::Window
+            ? m_wayland->createToplevelSession(m_target.name, m_cursor)
+            : m_wayland->createSession(m_target.name, m_cursor);
     if (!m_session)
         return false;
     connect(m_session.get(), &CaptureSession::stopped, this, [this] {
@@ -128,7 +195,7 @@ bool ScreenCastStream::start()
         if (m_finished)
             return;
         if (m_session->bufferSize().isEmpty() || !m_session->argbSupported()) {
-            qWarning() << "Unsupported capture constraints for" << m_output;
+            qWarning() << "Unsupported capture constraints for" << m_target.name;
             finish();
             return;
         }
@@ -144,45 +211,116 @@ bool ScreenCastStream::start()
     return true;
 }
 
-const spa_pod *ScreenCastStream::buildFormat(spa_pod_builder *builder) const
+bool ScreenCastStream::openGbm()
+{
+    if (m_gbm)
+        return true;
+    if (!m_wayland->dmabufAvailable() || !m_session->dmabufDevice()
+        || m_session->dmabufFormats().empty())
+        return false;
+    const QString node = drmNodeFor(m_session->dmabufDevice());
+    if (node.isEmpty())
+        return false;
+    m_gbmFd = open(QFile::encodeName(node).constData(), O_RDWR | O_CLOEXEC);
+    if (m_gbmFd < 0)
+        return false;
+    m_gbm = gbm_create_device(m_gbmFd);
+    if (!m_gbm) {
+        close(m_gbmFd);
+        m_gbmFd = -1;
+        return false;
+    }
+    return true;
+}
+
+// DMA-BUF formats first, each with the compositor's modifiers to choose from,
+// then plain memory. `fixate` puts the modifier settled on ahead of them so
+// PipeWire's next format is that one.
+void ScreenCastStream::buildFormats(spa_pod_builder *builder,
+                                    std::vector<const spa_pod *> &params, bool fixate) const
 {
     const spa_rectangle size {uint32_t(m_size.width()), uint32_t(m_size.height())};
     const spa_fraction variable {0, 1};
     const spa_fraction minimum {1, 1};
     const spa_fraction maximum {uint32_t(m_maxFramerate), 1};
-    // ARGB8888 little-endian memory order is what SPA calls BGRA; consumers that
-    // ignore alpha may pick BGRx over the same bytes.
-    return static_cast<const spa_pod *>(spa_pod_builder_add_object(
-            builder, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType,
-            SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype,
-            SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), SPA_FORMAT_VIDEO_format,
-            SPA_POD_CHOICE_ENUM_Id(3, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA,
-                                   SPA_VIDEO_FORMAT_BGRx),
-            SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size), SPA_FORMAT_VIDEO_framerate,
-            SPA_POD_Fraction(&variable), SPA_FORMAT_VIDEO_maxFramerate,
-            SPA_POD_CHOICE_RANGE_Fraction(&maximum, &minimum, &maximum)));
+    const auto timing = [&](spa_pod_frame *frame) {
+        spa_pod_builder_add(builder, SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
+                            SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&variable),
+                            SPA_FORMAT_VIDEO_maxFramerate,
+                            SPA_POD_CHOICE_RANGE_Fraction(&maximum, &minimum, &maximum), 0);
+        params.push_back(static_cast<const spa_pod *>(spa_pod_builder_pop(builder, frame)));
+    };
+    const auto begin = [&](spa_pod_frame *frame, spa_video_format format) {
+        spa_pod_builder_push_object(builder, frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+        spa_pod_builder_add(builder, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                            SPA_FORMAT_VIDEO_format, SPA_POD_Id(format), 0);
+    };
+
+    if (fixate) {
+        spa_pod_frame frame;
+        begin(&frame, spaFormat(m_fixateFormat));
+        spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+        spa_pod_builder_long(builder, int64_t(m_fixateModifier));
+        timing(&frame);
+    }
+    if (!m_avoidDmaBuf && m_gbm) {
+        for (const auto &[format, modifiers] : m_session->dmabufFormats()) {
+            if (spaFormat(format) == SPA_VIDEO_FORMAT_UNKNOWN || modifiers.empty())
+                continue;
+            spa_pod_frame frame, choice;
+            begin(&frame, spaFormat(format));
+            spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier,
+                                 SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
+            spa_pod_builder_push_choice(builder, &choice, SPA_CHOICE_Enum, 0);
+            // The first value is the default and repeats as the first choice.
+            spa_pod_builder_long(builder, int64_t(modifiers.front()));
+            for (const uint64_t modifier : modifiers)
+                spa_pod_builder_long(builder, int64_t(modifier));
+            spa_pod_builder_pop(builder, &choice);
+            timing(&frame);
+        }
+    }
+    {
+        spa_pod_frame frame;
+        spa_pod_builder_push_object(builder, &frame, SPA_TYPE_OBJECT_Format,
+                                    SPA_PARAM_EnumFormat);
+        spa_pod_builder_add(builder, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                            SPA_FORMAT_VIDEO_format,
+                            SPA_POD_CHOICE_ENUM_Id(3, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA,
+                                                   SPA_VIDEO_FORMAT_BGRx),
+                            0);
+        timing(&frame);
+    }
 }
 
 bool ScreenCastStream::connectStream()
 {
+    openGbm();
     auto *properties = pw_properties_new(PW_KEY_MEDIA_CLASS, "Video/Source", PW_KEY_MEDIA_ROLE,
                                          "Screen", PW_KEY_NODE_NAME, "cutefish-screencast",
-                                         PW_KEY_NODE_DESCRIPTION, qPrintable(m_output), nullptr);
+                                         PW_KEY_NODE_DESCRIPTION, qPrintable(m_target.name),
+                                         nullptr);
     m_stream = pw_stream_new(m_pipewire->core(), "cutefish-screencast", properties);
     if (!m_stream)
         return false;
     m_listener = new spa_hook {};
     pw_stream_add_listener(m_stream, m_listener, &streamEvents, this);
 
-    uint8_t storage[1024];
-    spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
-    const spa_pod *params[] = {buildFormat(&builder)};
+    uint8_t storage[4096];
+    spa_pod_dynamic_builder builder;
+    spa_pod_dynamic_builder_init(&builder, storage, sizeof(storage), 4096);
+    std::vector<const spa_pod *> params;
+    buildFormats(&builder.b, params, false);
     const int result = pw_stream_connect(
             m_stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
             static_cast<pw_stream_flags>(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS),
-            params, 1);
+            params.data(), uint32_t(params.size()));
+    spa_pod_dynamic_builder_clean(&builder);
     if (result < 0) {
-        qWarning() << "Cannot connect the PipeWire stream for" << m_output << spa_strerror(result);
+        qWarning() << "Cannot connect the PipeWire stream for" << m_target.name
+                   << spa_strerror(result);
         return false;
     }
     return true;
@@ -190,17 +328,20 @@ bool ScreenCastStream::connectStream()
 
 void ScreenCastStream::updateParams()
 {
-    uint8_t storage[1024];
-    spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
-    const spa_pod *params[] = {buildFormat(&builder)};
-    pw_stream_update_params(m_stream, params, 1);
+    uint8_t storage[4096];
+    spa_pod_dynamic_builder builder;
+    spa_pod_dynamic_builder_init(&builder, storage, sizeof(storage), 4096);
+    std::vector<const spa_pod *> params;
+    buildFormats(&builder.b, params, m_fixating);
+    pw_stream_update_params(m_stream, params.data(), uint32_t(params.size()));
+    spa_pod_dynamic_builder_clean(&builder);
 }
 
 void ScreenCastStream::handleStateChanged(int previous, int state, const char *error)
 {
     switch (state) {
     case PW_STREAM_STATE_ERROR:
-        qWarning() << "PipeWire stream error for" << m_output << error;
+        qWarning() << "PipeWire stream error for" << m_target.name << error;
         finish();
         break;
     case PW_STREAM_STATE_UNCONNECTED:
@@ -227,6 +368,39 @@ void ScreenCastStream::handleStateChanged(int previous, int state, const char *e
     }
 }
 
+// Settles a DONT_FIXATE modifier choice the way xdg-desktop-portal-wlr does:
+// whichever of the consumer's modifiers GBM will allocate wins. False means
+// none does, and DMA-BUFs are withdrawn from the offer.
+bool ScreenCastStream::chooseModifier(uint32_t format, const std::vector<uint64_t> &modifiers)
+{
+    if (!m_gbm || modifiers.empty())
+        return false;
+    if (gbm_bo *bo = gbm_bo_create_with_modifiers2(m_gbm, uint32_t(m_size.width()),
+                                                   uint32_t(m_size.height()), format,
+                                                   modifiers.data(), unsigned(modifiers.size()),
+                                                   GBM_BO_USE_RENDERING)) {
+        m_fixateModifier = gbm_bo_get_modifier(bo);
+        gbm_bo_destroy(bo);
+        m_fixateFormat = format;
+        return true;
+    }
+    for (const uint64_t modifier : modifiers) {
+        uint32_t flags = GBM_BO_USE_RENDERING;
+        if (modifier == DRM_FORMAT_MOD_LINEAR)
+            flags |= GBM_BO_USE_LINEAR;
+        else if (modifier != DRM_FORMAT_MOD_INVALID)
+            continue;
+        if (gbm_bo *bo = gbm_bo_create(m_gbm, uint32_t(m_size.width()),
+                                       uint32_t(m_size.height()), format, flags)) {
+            m_fixateModifier = gbm_bo_get_modifier(bo);
+            gbm_bo_destroy(bo);
+            m_fixateFormat = format;
+            return true;
+        }
+    }
+    return false;
+}
+
 void ScreenCastStream::handleFormat(const spa_pod *param)
 {
     spa_video_info_raw info {};
@@ -237,29 +411,74 @@ void ScreenCastStream::handleFormat(const spa_pod *param)
             : 0;
     if (m_framerate <= 0)
         m_framerate = m_maxFramerate;
+
+    const spa_pod_prop *modifier = spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier);
+    uint32_t dataType = 1 << SPA_DATA_MemFd;
+    int blocks = 1;
+    m_dmabuf = false;
+    if (modifier) {
+        const uint32_t format = drmFormat(info.format);
+        if (modifier->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) {
+            const spa_pod *choice = &modifier->value;
+            const uint32_t count = SPA_POD_CHOICE_N_VALUES(choice);
+            const auto *values = static_cast<const int64_t *>(SPA_POD_CHOICE_VALUES(choice));
+            // The first value is the default; the alternatives follow it.
+            std::vector<uint64_t> modifiers;
+            for (uint32_t index = 1; index < count; ++index)
+                modifiers.push_back(uint64_t(values[index]));
+            if (chooseModifier(format, modifiers)) {
+                m_fixating = true;
+                updateParams();
+                m_fixating = false;
+            } else {
+                qWarning() << "No DMA-BUF modifier can be allocated; falling back to memory";
+                m_avoidDmaBuf = true;
+                updateParams();
+            }
+            return;
+        }
+        m_dmabuf = true;
+        m_drmFormat = format;
+        m_modifier = uint64_t(info.modifier);
+        dataType = 1 << SPA_DATA_DmaBuf;
+        if (m_modifier != DRM_FORMAT_MOD_INVALID && m_gbm)
+            blocks = std::max(1, gbm_device_get_format_modifier_plane_count(m_gbm, m_drmFormat,
+                                                                              m_modifier));
+    }
+
     const int stride = int(info.size.width) * bytesPerPixel;
     const int size = stride * int(info.size.height);
-
-    uint8_t storage[1024];
+    uint8_t storage[2048];
     spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
-    const spa_pod *params[] = {
-            static_cast<const spa_pod *>(spa_pod_builder_add_object(
-                    &builder, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-                    SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, 8),
-                    SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1), SPA_PARAM_BUFFERS_size,
-                    SPA_POD_Int(size), SPA_PARAM_BUFFERS_stride, SPA_POD_Int(stride),
-                    SPA_PARAM_BUFFERS_align, SPA_POD_Int(16), SPA_PARAM_BUFFERS_dataType,
-                    SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd))),
-            static_cast<const spa_pod *>(spa_pod_builder_add_object(
-                    &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
-                    SPA_POD_Id(SPA_META_Header), SPA_PARAM_META_size,
-                    SPA_POD_Int(sizeof(spa_meta_header)))),
-            static_cast<const spa_pod *>(spa_pod_builder_add_object(
-                    &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
-                    SPA_POD_Id(SPA_META_VideoTransform), SPA_PARAM_META_size,
-                    SPA_POD_Int(sizeof(spa_meta_videotransform)))),
-    };
-    pw_stream_update_params(m_stream, params, 3);
+    std::vector<const spa_pod *> params;
+    {
+        spa_pod_frame frame;
+        spa_pod_builder_push_object(&builder, &frame, SPA_TYPE_OBJECT_ParamBuffers,
+                                    SPA_PARAM_Buffers);
+        spa_pod_builder_add(&builder, SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, 8),
+                            SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks), 0);
+        if (!m_dmabuf)
+            spa_pod_builder_add(&builder, SPA_PARAM_BUFFERS_size, SPA_POD_Int(size),
+                                SPA_PARAM_BUFFERS_stride, SPA_POD_Int(stride), 0);
+        spa_pod_builder_add(&builder, SPA_PARAM_BUFFERS_align, SPA_POD_Int(16),
+                            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(dataType), 0);
+        params.push_back(static_cast<const spa_pod *>(spa_pod_builder_pop(&builder, &frame)));
+    }
+    params.push_back(static_cast<const spa_pod *>(spa_pod_builder_add_object(
+            &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
+            SPA_POD_Id(SPA_META_Header), SPA_PARAM_META_size,
+            SPA_POD_Int(sizeof(spa_meta_header)))));
+    params.push_back(static_cast<const spa_pod *>(spa_pod_builder_add_object(
+            &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
+            SPA_POD_Id(SPA_META_VideoTransform), SPA_PARAM_META_size,
+            SPA_POD_Int(sizeof(spa_meta_videotransform)))));
+    params.push_back(static_cast<const spa_pod *>(spa_pod_builder_add_object(
+            &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
+            SPA_POD_Id(SPA_META_VideoDamage), SPA_PARAM_META_size,
+            SPA_POD_CHOICE_RANGE_Int(sizeof(spa_meta_region) * damageRegions,
+                                     sizeof(spa_meta_region),
+                                     sizeof(spa_meta_region) * damageRegions))));
+    pw_stream_update_params(m_stream, params.data(), uint32_t(params.size()));
 }
 
 void ScreenCastStream::addBuffer(pw_buffer *buffer)
@@ -267,30 +486,109 @@ void ScreenCastStream::addBuffer(pw_buffer *buffer)
     spa_data *data = buffer->buffer->datas;
     const int stride = m_size.width() * bytesPerPixel;
     const int size = stride * m_size.height();
-    if (buffer->buffer->n_datas < 1 || !(data[0].type & (1 << SPA_DATA_MemFd)) || size <= 0) {
+    if (buffer->buffer->n_datas < 1 || size <= 0) {
         finish();
         return;
     }
-    const int fd = memfd_create("cutefish-screencast", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    if (fd < 0 || ftruncate(fd, size) != 0) {
-        if (fd >= 0)
-            close(fd);
+    auto entry = std::make_unique<Buffer>();
+    if (m_dmabuf && (data[0].type & (1 << SPA_DATA_DmaBuf))) {
+        entry->bo = m_modifier == DRM_FORMAT_MOD_INVALID
+                ? gbm_bo_create(m_gbm, uint32_t(m_size.width()), uint32_t(m_size.height()),
+                                m_drmFormat, GBM_BO_USE_RENDERING)
+                : gbm_bo_create_with_modifiers2(m_gbm, uint32_t(m_size.width()),
+                                                uint32_t(m_size.height()), m_drmFormat,
+                                                &m_modifier, 1, GBM_BO_USE_RENDERING);
+        if (!entry->bo) {
+            qWarning() << "Cannot allocate a DMA-BUF for the stream";
+            finish();
+            return;
+        }
+        const int planes = gbm_bo_get_plane_count(entry->bo);
+        if (planes < 1 || uint32_t(planes) > buffer->buffer->n_datas) {
+            gbm_bo_destroy(entry->bo);
+            finish();
+            return;
+        }
+        std::vector<DmaBufPlane> description;
+        for (int plane = 0; plane < planes; ++plane) {
+            const int fd = gbm_bo_get_fd_for_plane(entry->bo, plane);
+            if (fd < 0) {
+                for (const int owned : entry->planeFds)
+                    close(owned);
+                gbm_bo_destroy(entry->bo);
+                finish();
+                return;
+            }
+            entry->planeFds.push_back(fd);
+            description.push_back({fd, gbm_bo_get_offset(entry->bo, plane),
+                                   gbm_bo_get_stride_for_plane(entry->bo, plane)});
+            data[plane].type = SPA_DATA_DmaBuf;
+            data[plane].fd = fd;
+            data[plane].mapoffset = 0;
+            data[plane].flags = SPA_DATA_FLAG_READWRITE;
+            data[plane].data = nullptr;
+            data[plane].chunk->offset = description.back().offset;
+            data[plane].chunk->stride = int32_t(description.back().stride);
+            data[plane].chunk->size = description.back().stride * uint32_t(m_size.height());
+            data[plane].maxsize = data[plane].chunk->offset + data[plane].chunk->size;
+        }
+        Buffer *raw = entry.get();
+        entry->importPending = m_wayland->createDmaBufBuffer(
+                m_size, m_drmFormat, gbm_bo_get_modifier(entry->bo), description,
+                [this, raw, alive = entry->alive](wl_buffer *imported) {
+                    if (!*alive)
+                        return;
+                    raw->importPending = false;
+                    raw->wlBuffer = imported;
+                    raw->importFailed = imported == nullptr;
+                    if (raw->importFailed) {
+                        qWarning() << "The compositor refused a DMA-BUF; falling back to memory";
+                        m_avoidDmaBuf = true;
+                        if (m_stream)
+                            updateParams();
+                    } else if (m_current && m_current->user_data == raw) {
+                        beginCapture();
+                    }
+                });
+        if (!entry->importPending) {
+            for (const int owned : entry->planeFds)
+                close(owned);
+            gbm_bo_destroy(entry->bo);
+            finish();
+            return;
+        }
+    } else if (!m_dmabuf && (data[0].type & (1 << SPA_DATA_MemFd))) {
+        entry->fd = memfd_create("cutefish-screencast", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (entry->fd < 0 || ftruncate(entry->fd, size) != 0) {
+            if (entry->fd >= 0)
+                close(entry->fd);
+            finish();
+            return;
+        }
+        // The compositor maps this through wl_shm; a shrinking file would fault it.
+        fcntl(entry->fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
+        entry->wlBuffer = m_wayland->createShmBuffer(entry->fd, m_size, stride);
+        data[0].type = SPA_DATA_MemFd;
+        data[0].fd = entry->fd;
+        data[0].maxsize = uint32_t(size);
+        data[0].mapoffset = 0;
+        data[0].flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
+        data[0].data = nullptr;
+        data[0].chunk->offset = 0;
+        data[0].chunk->stride = stride;
+        data[0].chunk->size = uint32_t(size);
+    } else {
         finish();
         return;
     }
-    // The compositor maps this through wl_shm; a shrinking file would fault it.
-    fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
-    auto *entry = new Buffer {fd, m_wayland->createShmBuffer(fd, m_size, stride)};
-    buffer->user_data = entry;
-    data[0].type = SPA_DATA_MemFd;
-    data[0].fd = fd;
-    data[0].maxsize = uint32_t(size);
-    data[0].mapoffset = 0;
-    data[0].flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
-    data[0].data = nullptr;
-    data[0].chunk->offset = 0;
-    data[0].chunk->stride = stride;
-    data[0].chunk->size = uint32_t(size);
+    if (!entry->wlBuffer && !entry->importPending) {
+        buffer->user_data = entry.release();
+        removeBuffer(buffer);
+        finish();
+        return;
+    }
+    m_buffers.push_back(entry.get());
+    buffer->user_data = entry.release();
 }
 
 void ScreenCastStream::removeBuffer(pw_buffer *buffer)
@@ -302,14 +600,21 @@ void ScreenCastStream::removeBuffer(pw_buffer *buffer)
         m_current = nullptr;
     }
     if (entry) {
+        *entry->alive = false;
+        m_buffers.erase(std::remove(m_buffers.begin(), m_buffers.end(), entry), m_buffers.end());
         if (entry->wlBuffer)
             wl_buffer_destroy(entry->wlBuffer);
+        for (const int fd : entry->planeFds)
+            close(fd);
+        if (entry->bo)
+            gbm_bo_destroy(entry->bo);
         if (entry->fd >= 0)
             close(entry->fd);
         delete entry;
     }
     buffer->user_data = nullptr;
-    buffer->buffer->datas[0].fd = -1;
+    for (uint32_t plane = 0; plane < buffer->buffer->n_datas; ++plane)
+        buffer->buffer->datas[plane].fd = -1;
 }
 
 void ScreenCastStream::captureNext()
@@ -340,12 +645,20 @@ void ScreenCastStream::beginCapture()
         return;
     }
     auto *entry = static_cast<Buffer *>(m_current->user_data);
+    if (entry && entry->importPending)
+        return; // The import's completion resumes this capture.
     m_lastCapture.restart();
-    if (!entry || !entry->wlBuffer || !m_session->capture(entry->wlBuffer))
+    // A buffer filled before only needs what it missed since; a fresh one,
+    // all of it.
+    QList<QRect> damage;
+    if (entry && entry->filled)
+        damage.append(entry->missed.isValid() ? entry->missed : QRect(0, 0, 0, 0));
+    if (!entry || !entry->wlBuffer || !m_session->capture(entry->wlBuffer, damage))
         returnCurrent(true);
 }
 
-void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform)
+void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform,
+                                  const QList<QRect> &damage)
 {
     if (!m_current)
         return;
@@ -361,6 +674,41 @@ void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform)
     if (auto *videoTransform = static_cast<spa_meta_videotransform *>(spa_buffer_find_meta_data(
                 buffer, SPA_META_VideoTransform, sizeof(spa_meta_videotransform))))
         videoTransform->transform = transform;
+    // Damage since the previous frame, as the compositor tracked it. More
+    // rectangles than fit collapse into their bounding box; a zero-sized
+    // region ends the list.
+    if (spa_meta *meta = spa_buffer_find_meta(buffer, SPA_META_VideoDamage)) {
+        auto *region = static_cast<spa_meta_region *>(spa_meta_first(meta));
+        const uint32_t capacity = meta->size / sizeof(spa_meta_region);
+        QList<QRect> rects = damage;
+        if (uint32_t(rects.size()) > capacity) {
+            QRect bounds;
+            for (const QRect &rect : rects)
+                bounds |= rect;
+            rects = {bounds};
+        }
+        uint32_t index = 0;
+        for (const QRect &rect : rects) {
+            region[index].region =
+                    SPA_REGION(rect.x(), rect.y(), uint32_t(rect.width()), uint32_t(rect.height()));
+            ++index;
+        }
+        if (index < capacity)
+            region[index].region = SPA_REGION(0, 0, 0, 0);
+    }
+    // Every other buffer has now missed this change too; this one is current.
+    QRect changed;
+    for (const QRect &rect : damage)
+        changed |= rect;
+    auto *current = static_cast<Buffer *>(m_current->user_data);
+    for (Buffer *other : m_buffers) {
+        if (other != current)
+            other->missed |= changed;
+    }
+    if (current) {
+        current->missed = QRect();
+        current->filled = true;
+    }
     buffer->datas[0].chunk->flags = SPA_CHUNK_FLAG_NONE;
     pw_stream_queue_buffer(m_stream, m_current);
     m_current = nullptr;

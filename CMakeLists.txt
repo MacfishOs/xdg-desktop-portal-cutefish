@@ -11,6 +11,8 @@ find_package(Qt6 REQUIRED COMPONENTS Core DBus)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PipeWire REQUIRED IMPORTED_TARGET libpipewire-0.3)
 pkg_check_modules(WaylandClient REQUIRED IMPORTED_TARGET wayland-client)
+pkg_check_modules(Gbm REQUIRED IMPORTED_TARGET gbm)
+pkg_check_modules(Libdrm REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(WaylandProtocols REQUIRED wayland-protocols>=1.39)
 pkg_get_variable(WAYLAND_PROTOCOLS_DATADIR wayland-protocols pkgdatadir)
 pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
@@ -56,13 +58,13 @@ add_executable(xdg-desktop-portal-cutefish
 )
 portal_wayland_protocol(xdg-desktop-portal-cutefish ext-image-capture-source-v1 staging/ext-image-capture-source)
 portal_wayland_protocol(xdg-desktop-portal-cutefish ext-image-copy-capture-v1 staging/ext-image-copy-capture)
-# The capture source manager's toplevel request references this interface at
-# link time; no window capture is requested.
 portal_wayland_protocol(xdg-desktop-portal-cutefish ext-foreign-toplevel-list-v1 staging/ext-foreign-toplevel-list)
 portal_wayland_protocol(xdg-desktop-portal-cutefish xdg-output-unstable-v1 unstable/xdg-output)
+portal_wayland_protocol(xdg-desktop-portal-cutefish linux-dmabuf-v1 stable/linux-dmabuf)
 target_include_directories(xdg-desktop-portal-cutefish PRIVATE ${PROTOCOL_DIR})
 target_link_libraries(xdg-desktop-portal-cutefish PRIVATE Qt6::Core Qt6::DBus
-    PkgConfig::PipeWire PkgConfig::WaylandClient Cutefish::Privacy)
+    PkgConfig::PipeWire PkgConfig::WaylandClient PkgConfig::Gbm PkgConfig::Libdrm
+    Cutefish::Privacy)
 target_compile_definitions(xdg-desktop-portal-cutefish PRIVATE
     PROJECT_VERSION="${PROJECT_VERSION}"
     FILE_CHOOSER_HELPER="${CMAKE_INSTALL_FULL_LIBEXECDIR}/cutefish-filechooser"

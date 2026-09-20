@@ -6,10 +6,21 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <utility>
+#include <ext-foreign-toplevel-list-v1-client-protocol.h>
 #include <ext-image-capture-source-v1-client-protocol.h>
 #include <ext-image-copy-capture-v1-client-protocol.h>
+#include <linux-dmabuf-v1-client-protocol.h>
 #include <wayland-client.h>
 #include <xdg-output-unstable-v1-client-protocol.h>
+
+struct WaylandCapture::Toplevel {
+    ext_foreign_toplevel_handle_v1 *handle = nullptr;
+    CaptureToplevel pending;
+    CaptureToplevel current;
+    bool done = false;
+    bool closed = false;
+};
 
 struct WaylandCapture::Output {
     wl_output *proxy = nullptr;
@@ -79,6 +90,45 @@ struct WaylandCaptureEvents {
     {
         static_cast<WaylandCapture *>(data)->handleGlobalRemove(name);
     }
+
+    static void toplevel(void *data, ext_foreign_toplevel_list_v1 *,
+                         ext_foreign_toplevel_handle_v1 *handle)
+    {
+        static_cast<WaylandCapture *>(data)->addToplevel(handle);
+    }
+
+    static void finished(void *, ext_foreign_toplevel_list_v1 *) {}
+
+    static void closed(void *data, ext_foreign_toplevel_handle_v1 *)
+    {
+        auto *toplevel = static_cast<WaylandCapture::Toplevel *>(data);
+        toplevel->closed = true;
+        // Handles are freed by the list on the next change; announce now.
+        toplevel->done = false;
+    }
+
+    static void done(void *data, ext_foreign_toplevel_handle_v1 *)
+    {
+        auto *toplevel = static_cast<WaylandCapture::Toplevel *>(data);
+        toplevel->current = toplevel->pending;
+        toplevel->done = true;
+    }
+
+    static void title(void *data, ext_foreign_toplevel_handle_v1 *, const char *title)
+    {
+        static_cast<WaylandCapture::Toplevel *>(data)->pending.title = QString::fromUtf8(title);
+    }
+
+    static void appId(void *data, ext_foreign_toplevel_handle_v1 *, const char *appId)
+    {
+        static_cast<WaylandCapture::Toplevel *>(data)->pending.appId = QString::fromUtf8(appId);
+    }
+
+    static void identifier(void *data, ext_foreign_toplevel_handle_v1 *, const char *identifier)
+    {
+        static_cast<WaylandCapture::Toplevel *>(data)->pending.identifier =
+                QString::fromUtf8(identifier);
+    }
 };
 
 struct CaptureSessionEvents {
@@ -98,15 +148,31 @@ struct CaptureSessionEvents {
             static_cast<CaptureSession *>(data)->m_pendingArgb = true;
     }
 
-    static void dmabufDevice(void *, ext_image_copy_capture_session_v1 *, wl_array *) {}
+    static void dmabufDevice(void *data, ext_image_copy_capture_session_v1 *, wl_array *device)
+    {
+        auto *session = static_cast<CaptureSession *>(data);
+        session->m_pendingDmabufDevice = 0;
+        if (device->size == sizeof(dev_t))
+            std::memcpy(&session->m_pendingDmabufDevice, device->data, sizeof(dev_t));
+        session->m_pendingDmabufFormats.clear();
+    }
 
-    static void dmabufFormat(void *, ext_image_copy_capture_session_v1 *, uint32_t, wl_array *) {}
+    static void dmabufFormat(void *data, ext_image_copy_capture_session_v1 *, uint32_t format,
+                             wl_array *modifiers)
+    {
+        auto *session = static_cast<CaptureSession *>(data);
+        const auto *begin = static_cast<const uint64_t *>(modifiers->data);
+        session->m_pendingDmabufFormats[format].assign(
+                begin, begin + modifiers->size / sizeof(uint64_t));
+    }
 
     static void done(void *data, ext_image_copy_capture_session_v1 *)
     {
         auto *session = static_cast<CaptureSession *>(data);
         session->m_size = session->m_pendingSize;
         session->m_argb = session->m_pendingArgb;
+        session->m_dmabufDevice = session->m_pendingDmabufDevice;
+        session->m_dmabufFormats = session->m_pendingDmabufFormats;
         session->m_ready = true;
         Q_EMIT session->constraintsChanged();
     }
@@ -125,9 +191,10 @@ struct CaptureSessionEvents {
         static_cast<CaptureSession *>(data)->m_transform = transform;
     }
 
-    static void damage(void *, ext_image_copy_capture_frame_v1 *, int32_t, int32_t, int32_t,
-                       int32_t)
+    static void damage(void *data, ext_image_copy_capture_frame_v1 *, int32_t x, int32_t y,
+                       int32_t width, int32_t height)
     {
+        static_cast<CaptureSession *>(data)->m_damage.append(QRect(x, y, width, height));
     }
 
     static void presentationTime(void *data, ext_image_copy_capture_frame_v1 *, uint32_t hi,
@@ -142,7 +209,8 @@ struct CaptureSessionEvents {
         auto *session = static_cast<CaptureSession *>(data);
         ext_image_copy_capture_frame_v1_destroy(session->m_frame);
         session->m_frame = nullptr;
-        Q_EMIT session->frameReady(session->m_presentationNs, session->m_transform);
+        const QList<QRect> damage = std::exchange(session->m_damage, {});
+        Q_EMIT session->frameReady(session->m_presentationNs, session->m_transform, damage);
     }
 
     static void failed(void *data, ext_image_copy_capture_frame_v1 *, uint32_t reason)
@@ -150,6 +218,7 @@ struct CaptureSessionEvents {
         auto *session = static_cast<CaptureSession *>(data);
         ext_image_copy_capture_frame_v1_destroy(session->m_frame);
         session->m_frame = nullptr;
+        session->m_damage.clear();
         Q_EMIT session->frameFailed(reason);
     }
 };
@@ -158,6 +227,13 @@ namespace {
 
 const wl_registry_listener registryListener = {WaylandCaptureEvents::global,
                                                WaylandCaptureEvents::globalRemove};
+
+const ext_foreign_toplevel_list_v1_listener toplevelListListener = {
+        WaylandCaptureEvents::toplevel, WaylandCaptureEvents::finished};
+
+const ext_foreign_toplevel_handle_v1_listener toplevelListener = {
+        WaylandCaptureEvents::closed, WaylandCaptureEvents::done, WaylandCaptureEvents::title,
+        WaylandCaptureEvents::appId, WaylandCaptureEvents::identifier};
 
 const ext_image_copy_capture_session_v1_listener sessionListener = {
         CaptureSessionEvents::bufferSize,   CaptureSessionEvents::shmFormat,
@@ -229,7 +305,51 @@ void WaylandCapture::handleGlobal(uint32_t name, const char *interface, uint32_t
     } else if (!strcmp(interface, ext_image_copy_capture_manager_v1_interface.name)) {
         m_copies = static_cast<ext_image_copy_capture_manager_v1 *>(
                 wl_registry_bind(m_registry, name, &ext_image_copy_capture_manager_v1_interface, 1));
+    } else if (!strcmp(interface,
+                       ext_foreign_toplevel_image_capture_source_manager_v1_interface.name)) {
+        m_toplevelSources =
+                static_cast<ext_foreign_toplevel_image_capture_source_manager_v1 *>(wl_registry_bind(
+                        m_registry, name,
+                        &ext_foreign_toplevel_image_capture_source_manager_v1_interface, 1));
+    } else if (!strcmp(interface, ext_foreign_toplevel_list_v1_interface.name)) {
+        m_toplevelList = static_cast<ext_foreign_toplevel_list_v1 *>(
+                wl_registry_bind(m_registry, name, &ext_foreign_toplevel_list_v1_interface, 1));
+        ext_foreign_toplevel_list_v1_add_listener(m_toplevelList, &toplevelListListener, this);
+    } else if (!strcmp(interface, zwp_linux_dmabuf_v1_interface.name)) {
+        // Only create_params is used; the compositor's own capture constraints
+        // say which formats to allocate, so no feedback object is needed.
+        m_dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(wl_registry_bind(
+                m_registry, name, &zwp_linux_dmabuf_v1_interface, std::min(version, 4u)));
     }
+}
+
+void WaylandCapture::addToplevel(ext_foreign_toplevel_handle_v1 *handle)
+{
+    // A closed window's handle is dropped once a new one arrives, which is
+    // also when the change is worth announcing.
+    for (auto it = m_toplevels.begin(); it != m_toplevels.end();) {
+        if ((*it)->closed) {
+            ext_foreign_toplevel_handle_v1_destroy((*it)->handle);
+            it = m_toplevels.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto toplevel = std::make_unique<Toplevel>();
+    toplevel->handle = handle;
+    ext_foreign_toplevel_handle_v1_add_listener(handle, &toplevelListener, toplevel.get());
+    m_toplevels.push_back(std::move(toplevel));
+    Q_EMIT toplevelsChanged();
+}
+
+QList<CaptureToplevel> WaylandCapture::toplevels() const
+{
+    QList<CaptureToplevel> result;
+    for (const auto &toplevel : m_toplevels) {
+        if (toplevel->done && !toplevel->closed && !toplevel->current.identifier.isEmpty())
+            result.append(toplevel->current);
+    }
+    return result;
 }
 
 void WaylandCapture::handleGlobalRemove(uint32_t name)
@@ -277,7 +397,29 @@ std::unique_ptr<CaptureSession> WaylandCapture::createSession(const QString &nam
     });
     if (it == m_outputs.end())
         return nullptr;
-    auto *source = ext_output_image_capture_source_manager_v1_create_source(m_sources, (*it)->proxy);
+    return makeSession(
+            ext_output_image_capture_source_manager_v1_create_source(m_sources, (*it)->proxy),
+            cursor);
+}
+
+std::unique_ptr<CaptureSession> WaylandCapture::createToplevelSession(const QString &identifier,
+                                                                      bool cursor)
+{
+    if (!captureAvailable() || !m_toplevelSources)
+        return nullptr;
+    const auto it = std::find_if(m_toplevels.begin(), m_toplevels.end(), [&](const auto &toplevel) {
+        return toplevel->done && !toplevel->closed && toplevel->current.identifier == identifier;
+    });
+    if (it == m_toplevels.end())
+        return nullptr;
+    return makeSession(ext_foreign_toplevel_image_capture_source_manager_v1_create_source(
+                               m_toplevelSources, (*it)->handle),
+                       cursor);
+}
+
+std::unique_ptr<CaptureSession> WaylandCapture::makeSession(ext_image_capture_source_v1 *source,
+                                                            bool cursor)
+{
     auto *session = ext_image_copy_capture_manager_v1_create_session(
             m_copies, source, cursor ? EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_OPTIONS_PAINT_CURSORS : 0);
     // The session keeps its own reference to the source.
@@ -286,6 +428,49 @@ std::unique_ptr<CaptureSession> WaylandCapture::createSession(const QString &nam
     ext_image_copy_capture_session_v1_add_listener(session, &sessionListener, result.get());
     flush();
     return result;
+}
+
+namespace {
+
+struct PendingDmaBuf {
+    std::function<void(wl_buffer *)> done;
+};
+
+const zwp_linux_buffer_params_v1_listener paramsListener = {
+        [](void *data, zwp_linux_buffer_params_v1 *params, wl_buffer *buffer) {
+            auto *pending = static_cast<PendingDmaBuf *>(data);
+            zwp_linux_buffer_params_v1_destroy(params);
+            const auto done = std::move(pending->done);
+            delete pending;
+            done(buffer);
+        },
+        [](void *data, zwp_linux_buffer_params_v1 *params) {
+            auto *pending = static_cast<PendingDmaBuf *>(data);
+            zwp_linux_buffer_params_v1_destroy(params);
+            const auto done = std::move(pending->done);
+            delete pending;
+            done(nullptr);
+        }};
+
+} // namespace
+
+bool WaylandCapture::createDmaBufBuffer(const QSize &size, uint32_t format, uint64_t modifier,
+                                        const std::vector<DmaBufPlane> &planes,
+                                        std::function<void(wl_buffer *)> done)
+{
+    if (!m_dmabuf || planes.empty())
+        return false;
+    auto *params = zwp_linux_dmabuf_v1_create_params(m_dmabuf);
+    for (size_t index = 0; index < planes.size(); ++index) {
+        zwp_linux_buffer_params_v1_add(params, planes[index].fd, uint32_t(index),
+                                       planes[index].offset, planes[index].stride,
+                                       uint32_t(modifier >> 32), uint32_t(modifier & 0xffffffff));
+    }
+    zwp_linux_buffer_params_v1_add_listener(params, &paramsListener,
+                                            new PendingDmaBuf {std::move(done)});
+    zwp_linux_buffer_params_v1_create(params, size.width(), size.height(), format, 0);
+    flush();
+    return true;
 }
 
 wl_buffer *WaylandCapture::createShmBuffer(int fd, const QSize &size, int stride)
@@ -344,6 +529,15 @@ void WaylandCapture::disconnect()
         wl_output_destroy(output->proxy);
     }
     m_outputs.clear();
+    for (auto &toplevel : m_toplevels)
+        ext_foreign_toplevel_handle_v1_destroy(toplevel->handle);
+    m_toplevels.clear();
+    if (m_toplevelList)
+        ext_foreign_toplevel_list_v1_destroy(m_toplevelList);
+    if (m_toplevelSources)
+        ext_foreign_toplevel_image_capture_source_manager_v1_destroy(m_toplevelSources);
+    if (m_dmabuf)
+        zwp_linux_dmabuf_v1_destroy(m_dmabuf);
     if (m_copies)
         ext_image_copy_capture_manager_v1_destroy(m_copies);
     if (m_sources)
@@ -356,11 +550,15 @@ void WaylandCapture::disconnect()
     wl_display_disconnect(m_display);
     m_copies = nullptr;
     m_sources = nullptr;
+    m_toplevelSources = nullptr;
+    m_toplevelList = nullptr;
+    m_dmabuf = nullptr;
     m_xdgOutputs = nullptr;
     m_shm = nullptr;
     m_registry = nullptr;
     m_display = nullptr;
     Q_EMIT outputsChanged();
+    Q_EMIT toplevelsChanged();
 }
 
 CaptureSession::CaptureSession(WaylandCapture *wayland, ext_image_copy_capture_session_v1 *session)
@@ -388,14 +586,24 @@ CaptureSession::~CaptureSession()
     m_wayland->flush();
 }
 
-bool CaptureSession::capture(wl_buffer *buffer)
+bool CaptureSession::capture(wl_buffer *buffer, const QList<QRect> &damage)
 {
     if (!m_session || m_stopped || m_frame || !buffer)
         return false;
     m_frame = ext_image_copy_capture_session_v1_create_frame(m_session);
     ext_image_copy_capture_frame_v1_add_listener(m_frame, &frameListener, this);
     ext_image_copy_capture_frame_v1_attach_buffer(m_frame, buffer);
-    ext_image_copy_capture_frame_v1_damage_buffer(m_frame, 0, 0, m_size.width(), m_size.height());
+    if (damage.isEmpty()) {
+        ext_image_copy_capture_frame_v1_damage_buffer(m_frame, 0, 0, m_size.width(),
+                                                      m_size.height());
+    } else {
+        for (const QRect &rect : damage) {
+            const QRect clipped = rect.intersected(QRect(QPoint(), m_size));
+            if (!clipped.isEmpty())
+                ext_image_copy_capture_frame_v1_damage_buffer(m_frame, clipped.x(), clipped.y(),
+                                                              clipped.width(), clipped.height());
+        }
+    }
     ext_image_copy_capture_frame_v1_capture(m_frame);
     m_wayland->flush();
     return true;

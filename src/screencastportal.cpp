@@ -17,6 +17,7 @@
 namespace {
 
 constexpr uint sourceMonitor = 1;
+constexpr uint sourceWindow = 2;
 constexpr uint cursorHidden = 1;
 constexpr uint cursorEmbedded = 2;
 constexpr uint persistNone = 0;
@@ -106,6 +107,7 @@ public:
     bool sourcesSelected = false;
     bool started = false;
     bool closed = false;
+    uint types = sourceMonitor;
     QStringList restore;
     QList<ScreenCastStream *> streams;
     StartRequest *request = nullptr;
@@ -152,8 +154,11 @@ public:
                 return output.name == name;
             });
         };
+        // A standing grant with the monitors it was given for streams without
+        // asking; a window is chosen afresh every time, its identifier being
+        // good for one lifetime only.
         const auto grant = permissions->grant(session->appId);
-        if (grant && grant->allowed) {
+        if (grant && grant->allowed && (session->types & sourceMonitor)) {
             QStringList monitors;
             if (!session->restore.isEmpty()
                 && std::all_of(session->restore.begin(), session->restore.end(), known))
@@ -161,11 +166,20 @@ public:
             else if (!grant->monitors.isEmpty()
                      && std::all_of(grant->monitors.begin(), grant->monitors.end(), known))
                 monitors = grant->monitors;
-            else if (outputs.size() == 1)
-                monitors = {outputs.first().name};
             if (!monitors.isEmpty()) {
-                startStreams(monitors, session->persistMode);
+                QList<CaptureTarget> targets;
+                for (const QString &name : monitors)
+                    targets.append({CaptureTarget::Kind::Monitor, name});
+                startStreams(targets, session->persistMode);
                 return;
+            }
+        }
+        QVariantList windows;
+        if (session->types & sourceWindow) {
+            for (const auto &toplevel : wayland->toplevels()) {
+                windows.append(QVariantMap {{QStringLiteral("identifier"), toplevel.identifier},
+                                            {QStringLiteral("title"), toplevel.title},
+                                            {QStringLiteral("app_id"), toplevel.appId}});
             }
         }
         QVariantList monitors;
@@ -181,8 +195,13 @@ public:
                 QStringLiteral("com.cutefish.Services"),
                 QStringLiteral("/com/cutefish/Services/Permissions"),
                 QStringLiteral("com.cutefish.Services.Permissions"), QStringLiteral("Prompt"));
+        QVariantMap options {{QStringLiteral("types"), session->types}};
+        if (session->types & sourceMonitor)
+            options.insert(QStringLiteral("monitors"), monitors);
+        if (session->types & sourceWindow)
+            options.insert(QStringLiteral("windows"), windows);
         call.setArguments({path, QStringLiteral("screen-recording"), session->appId, parentWindow,
-                           QVariantMap {{QStringLiteral("monitors"), monitors}}});
+                           options});
         // The user answers in their own time.
         prompting = true;
         auto *pending = new QDBusPendingCallWatcher(bus.asyncCall(call, INT_MAX), this);
@@ -246,35 +265,61 @@ private:
             finish(response == 1 ? 1 : 2);
             return;
         }
-        const QVariant chosen = results.value(QStringLiteral("monitors"));
-        const QStringList monitors = chosen.canConvert<QDBusArgument>()
-                ? qdbus_cast<QStringList>(chosen)
-                : chosen.toStringList();
+        const auto names = [&](const char *key) {
+            const QVariant chosen = results.value(QLatin1String(key));
+            return chosen.canConvert<QDBusArgument>() ? qdbus_cast<QStringList>(chosen)
+                                                      : chosen.toStringList();
+        };
+        const QStringList monitors = names("monitors");
+        const QStringList windows = names("windows");
         const bool always = results.value(QStringLiteral("always")).toBool();
         if (always)
             permissions->allow(session->appId, monitors);
         else
             permissions->record(session->appId);
+        QList<CaptureTarget> targets;
+        for (const QString &name : monitors)
+            targets.append({CaptureTarget::Kind::Monitor, name});
+        for (const QString &identifier : windows)
+            targets.append({CaptureTarget::Kind::Window, identifier});
         // An application's own restore token is only honoured while the grant
-        // stands, so it is handed out with "always" alone.
-        startStreams(monitors, always ? session->persistMode : persistNone);
+        // stands and names monitors, so it is handed out with "always" alone.
+        startStreams(targets, always && windows.isEmpty() ? session->persistMode : persistNone);
     }
 
 private:
-    void startStreams(const QStringList &monitors, uint persist)
+    void startStreams(const QList<CaptureTarget> &targets, uint persist)
     {
         const auto outputs = wayland->outputs();
-        QStringList selected;
-        for (const auto &name : monitors) {
-            const auto it = std::find_if(outputs.begin(), outputs.end(), [&](const auto &output) {
-                return output.name == name;
-            });
-            if (it == outputs.end() || selected.contains(name))
+        const auto toplevels = wayland->toplevels();
+        // A window is painted at its output's rate; the fastest is close enough.
+        int windowFramerate = 1;
+        for (const auto &output : outputs)
+            windowFramerate = std::max(windowFramerate, framerateFor(output));
+        QList<CaptureTarget> selected;
+        for (const auto &target : targets) {
+            int framerate = windowFramerate;
+            if (target.kind == CaptureTarget::Kind::Monitor) {
+                const auto it =
+                        std::find_if(outputs.begin(), outputs.end(), [&](const auto &output) {
+                            return output.name == target.name;
+                        });
+                if (it == outputs.end())
+                    continue;
+                framerate = framerateFor(*it);
+            } else if (std::none_of(toplevels.begin(), toplevels.end(), [&](const auto &toplevel) {
+                           return toplevel.identifier == target.name;
+                       })) {
                 continue;
-            selected.append(name);
-            auto *stream = new ScreenCastStream(wayland, pipewire, name,
-                                                session->cursorMode == cursorEmbedded,
-                                                framerateFor(*it), this);
+            }
+            if (std::any_of(selected.begin(), selected.end(), [&](const CaptureTarget &other) {
+                    return other.kind == target.kind && other.name == target.name;
+                }))
+                continue;
+            selected.append(target);
+            auto *stream = new ScreenCastStream(wayland, pipewire, target,
+                                                session->cursorMode == cursorEmbedded, framerate,
+                                                this);
             pending.append(stream);
             connect(stream, &ScreenCastStream::failed, this, [this] {
                 finish(2);
@@ -305,25 +350,37 @@ private:
         }
         const auto outputs = wayland->outputs();
         QList<StreamInfo> streams;
+        QStringList monitors;
         for (auto *stream : pending) {
-            const auto it = std::find_if(outputs.begin(), outputs.end(), [&](const auto &output) {
-                return output.name == selected.at(streams.size());
-            });
-            QVariantMap properties {{QStringLiteral("source_type"), sourceMonitor}};
-            if (it != outputs.end()) {
-                properties.insert(QStringLiteral("position"),
-                                  QVariant::fromValue(IntPair {it->logicalPosition.x(),
-                                                               it->logicalPosition.y()}));
+            const CaptureTarget &target = selected.at(streams.size());
+            QVariantMap properties;
+            if (target.kind == CaptureTarget::Kind::Monitor) {
+                monitors.append(target.name);
+                properties.insert(QStringLiteral("source_type"), sourceMonitor);
+                const auto it =
+                        std::find_if(outputs.begin(), outputs.end(), [&](const auto &output) {
+                            return output.name == target.name;
+                        });
+                if (it != outputs.end()) {
+                    properties.insert(QStringLiteral("position"),
+                                      QVariant::fromValue(IntPair {it->logicalPosition.x(),
+                                                                   it->logicalPosition.y()}));
+                    properties.insert(QStringLiteral("size"),
+                                      QVariant::fromValue(IntPair {it->logicalSize.width(),
+                                                                   it->logicalSize.height()}));
+                }
+            } else {
+                properties.insert(QStringLiteral("source_type"), sourceWindow);
                 properties.insert(QStringLiteral("size"),
-                                  QVariant::fromValue(IntPair {it->logicalSize.width(),
-                                                               it->logicalSize.height()}));
+                                  QVariant::fromValue(IntPair {stream->size().width(),
+                                                               stream->size().height()}));
             }
             streams.append({stream->nodeId(), properties});
         }
         QVariantMap results {{QStringLiteral("streams"), QVariant::fromValue(streams)}};
         results.insert(QStringLiteral("persist_mode"), granted);
         if (granted != persistNone)
-            results.insert(QStringLiteral("restore_data"), restoreData(selected));
+            results.insert(QStringLiteral("restore_data"), restoreData(monitors));
         // The session owns the streams from here; a stream ending closes it.
         for (auto *stream : pending) {
             stream->setParent(session);
@@ -346,7 +403,7 @@ private:
     PipeWireCore *pipewire;
     ScreenRecordingPermissions *permissions;
     QList<ScreenCastStream *> pending;
-    QStringList selected;
+    QList<CaptureTarget> selected;
     uint granted = persistNone;
     bool prompting = false;
     bool finished = false;
@@ -435,11 +492,12 @@ uint ScreenCastPortal::SelectSources(const QDBusObjectPath &handle,
     const uint types = options.value(QStringLiteral("types"), sourceMonitor).toUInt();
     const uint cursorMode = options.value(QStringLiteral("cursor_mode"), cursorHidden).toUInt();
     const uint persistMode = options.value(QStringLiteral("persist_mode"), persistNone).toUInt();
-    if (!(types & sourceMonitor) || (cursorMode & ~availableCursorModes()) || cursorMode == 0
-        || persistMode > persistUntilRevoked) {
+    if (!(types & availableSourceTypes()) || (cursorMode & ~availableCursorModes())
+        || cursorMode == 0 || persistMode > persistUntilRevoked) {
         session->close(true);
         return 2;
     }
+    session->types = types & availableSourceTypes();
     session->cursorMode = cursorMode;
     session->persistMode = persistMode;
     session->multiple = options.value(QStringLiteral("multiple"), false).toBool();

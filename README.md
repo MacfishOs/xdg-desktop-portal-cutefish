@@ -72,8 +72,9 @@ cookie lifetimes, ownership, cancellation during acquisition, and error handling
 ## Screen cast
 
 `org.freedesktop.impl.portal.ScreenCast` (version 4) lets applications share a
-monitor through PipeWire: OBS, Chromium and Electron applications, Firefox, and
-screen sharing in Discord, Zoom or Meet all go through this interface.
+monitor or a window through PipeWire: OBS, Chromium and Electron applications,
+Firefox, and screen sharing in Discord, Zoom or Meet all go through this
+interface.
 
 ```text
 application → xdg-desktop-portal (ScreenCast, OpenPipeWireRemote)
@@ -85,42 +86,61 @@ application → xdg-desktop-portal (ScreenCast, OpenPipeWireRemote)
 
 No new Wayland protocol is involved: the backend is an ordinary client of the
 compositor's `ext-image-capture-source-v1` / `ext-image-copy-capture-v1`
-implementation, the same one `cutefish-screenshot` uses. The compositor only
-announces those globals to allowlisted executables, and it allowlists this
-backend at its installed path, so a build-tree backend cannot capture a live
-session.
+implementation, the same one `cutefish-screenshot` uses, plus the standard
+`ext-foreign-toplevel-list-v1` for the windows it may capture and
+`linux-dmabuf-v1` for the buffers it allocates. The compositor only announces
+those globals to allowlisted executables, and it allowlists this backend at
+its installed path, so a build-tree backend cannot capture a live session.
 
-Each stream is one PipeWire `Video/Source` node. Buffers are memfd-backed
-`wl_shm` buffers handed to PipeWire as `MemFd` data (`BGRA`, with `BGRx`
-offered for consumers that ignore alpha) at the output's pixel size, with a
-variable frame rate capped at the output's refresh rate and at whatever the
-consumer negotiates. Frames carry `Header` (presentation time from the
-compositor, sequence number) and `VideoTransform` metadata; a frame is only
-requested while a PipeWire buffer is free, and the throttle is one capture per
-frame period. Output size changes renegotiate the stream; output removal or a
-compositor disconnect closes the session, which the frontend sees as
-`Session.Closed`.
+Each stream is one PipeWire `Video/Source` node at the source's pixel size,
+with a variable frame rate capped at the output's refresh rate and at whatever
+the consumer negotiates. Buffers are negotiated with the consumer:
 
-Supported: `MONITOR` sources (`AvailableSourceTypes` = 1), one monitor per
-session, `Hidden` and `Embedded` cursor modes (`AvailableCursorModes` = 3),
-`persist_mode` and `restore_data` (vendor `Cutefish`, version 1, `monitors`).
-Not supported: window and virtual sources, cursor metadata, DMA-BUF buffers,
-and damage metadata; consumers receive full frames.
+- DMA-BUFs, when the compositor advertises formats it can render into and the
+  consumer accepts one of their modifiers. The backend allocates them with
+  GBM on the render node the compositor names, wraps them as `wl_buffer`s
+  through `linux-dmabuf-v1`, and hands them to PipeWire as `DmaBuf` data; the
+  compositor renders each frame straight into the buffer on the GPU. A
+  modifier choice the consumer leaves open is settled by test-allocating, as
+  xdg-desktop-portal-wlr does; if nothing allocates, the offer is withdrawn.
+- Otherwise memfd-backed `wl_shm` buffers handed to PipeWire as `MemFd`
+  (`BGRA`, with `BGRx` offered for consumers that ignore alpha), filled by a
+  GPU readback in the compositor.
+
+Frames carry `Header` (presentation time from the compositor, sequence
+number), `VideoTransform` and `VideoDamage` metadata. Damage is what the
+compositor tracked since the session's previous frame, up to 16 rectangles
+(more collapse into their bounding box; an empty list means nothing changed);
+the backend also tells the compositor what each buffer missed while other
+buffers were filled. A frame is only requested while a PipeWire buffer is
+free, and the throttle is one capture per frame period. Source size changes
+renegotiate the stream; output removal, a closed window, or a compositor
+disconnect closes the session, which the frontend sees as `Session.Closed`.
+
+Supported: `MONITOR` and `WINDOW` sources (`AvailableSourceTypes` = 3), one
+source per session, `Hidden` and `Embedded` cursor modes (`AvailableCursorModes`
+= 3), `persist_mode` and `restore_data` for monitor selections (vendor
+`Cutefish`, version 1, `monitors`). A window stream reports `size` and
+`source_type` 2 and no position; the window is captured with its frame and
+rounded corners, without shadow. Not supported: virtual sources and cursor
+metadata.
 
 ### Permission
 
 `Start` asks the user through `cutefish-services`
 (`com.cutefish.Services.Permissions.Prompt`, kind `screen-recording`), which
-shows the requesting application, the displays to choose from, and Deny,
-Allow Once and Always Allow. The decision is recorded in
+shows the requesting application, the displays and windows to choose from as
+the application's source types allow, and Deny, Allow Once and Always Allow. The decision is recorded in
 `~/.config/cutefish/privacy.conf` through the framework's
 `ScreenRecordingPermissions`:
 
 - every application that has asked is listed, so Settings › Privacy can grant
   or revoke it later;
 - Always Allow stores the grant and the chosen monitors, and the next `Start`
-  from that application streams without a prompt as long as the monitors still
-  exist (a single monitor is chosen automatically);
+  from that application streams without a prompt as long as those monitors
+  still exist. A window is chosen afresh every time: its identifier lasts one
+  window lifetime, so a grant without stored monitors (a window choice, or a
+  switch turned on in Settings) still shows the picker;
 - an application's own `restore_data` is honoured only while its grant stands,
   and `persist_mode`/`restore_data` are only returned after Always Allow;
 - Deny closes the request with response 1, and the frontend closes the session.
@@ -173,8 +193,8 @@ their existing GTK settings-file handling.
 ## Build and test
 
 Build requirements: CMake 3.18+, a C++17 compiler, Qt 6 Core/DBus development
-packages, `libpipewire-0.3`, `wayland-client`, `wayland-scanner` and
-`wayland-protocols` 1.39+, and the sibling `cutefish-framework` checkout (the
+packages, `libpipewire-0.3`, `wayland-client`, `wayland-scanner`,
+`wayland-protocols` 1.39+, `gbm`, `libdrm`, and the sibling `cutefish-framework` checkout (the
 permission store is built from `../cutefish-framework/privacy`). Tests
 additionally require `dbus-run-session`, Python 3, and GObject/GIO
 bindings (`python3-gi` on Debian). An installed `xdg-desktop-portal` enables the

@@ -25,8 +25,8 @@ public:
     ~ScreenCastPortal() override;
 
     uint version() const { return 4; }
-    // Monitors only; the compositor exposes no window or virtual sources.
-    uint availableSourceTypes() const { return 1; }
+    // Monitors and windows; the compositor exposes no virtual sources.
+    uint availableSourceTypes() const { return 1 | 2; }
     // Hidden or embedded; cursor metadata is not produced.
     uint availableCursorModes() const { return 1 | 2; }
 
