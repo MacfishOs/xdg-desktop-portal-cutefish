@@ -126,6 +126,32 @@ QString drmNodeFor(dev_t device)
     return {};
 }
 
+// A buffer with exactly this modifier. Some GBM backends (virgl among them)
+// refuse gbm_bo_create_with_modifiers even for LINEAR, while the flag form
+// allocates a linear buffer fine; both forms are tried so the buffer path
+// accepts whatever the modifier probe accepted.
+gbm_bo *allocateDmaBuf(gbm_device *gbm, const QSize &size, uint32_t format, uint64_t modifier)
+{
+    const auto width = uint32_t(size.width());
+    const auto height = uint32_t(size.height());
+    if (modifier != DRM_FORMAT_MOD_INVALID) {
+        if (gbm_bo *bo = gbm_bo_create_with_modifiers2(gbm, width, height, format, &modifier, 1,
+                                                       GBM_BO_USE_RENDERING))
+            return bo;
+        if (modifier != DRM_FORMAT_MOD_LINEAR)
+            return nullptr;
+    }
+    uint32_t flags = GBM_BO_USE_RENDERING;
+    if (modifier == DRM_FORMAT_MOD_LINEAR)
+        flags |= GBM_BO_USE_LINEAR;
+    gbm_bo *bo = gbm_bo_create(gbm, width, height, format, flags);
+    if (bo && modifier != DRM_FORMAT_MOD_INVALID && gbm_bo_get_modifier(bo) != modifier) {
+        gbm_bo_destroy(bo);
+        return nullptr;
+    }
+    return bo;
+}
+
 } // namespace
 
 ScreenCastStream::ScreenCastStream(WaylandCapture *wayland, PipeWireCore *pipewire,
@@ -385,13 +411,7 @@ bool ScreenCastStream::chooseModifier(uint32_t format, const std::vector<uint64_
         return true;
     }
     for (const uint64_t modifier : modifiers) {
-        uint32_t flags = GBM_BO_USE_RENDERING;
-        if (modifier == DRM_FORMAT_MOD_LINEAR)
-            flags |= GBM_BO_USE_LINEAR;
-        else if (modifier != DRM_FORMAT_MOD_INVALID)
-            continue;
-        if (gbm_bo *bo = gbm_bo_create(m_gbm, uint32_t(m_size.width()),
-                                       uint32_t(m_size.height()), format, flags)) {
+        if (gbm_bo *bo = allocateDmaBuf(m_gbm, m_size, format, modifier)) {
             m_fixateModifier = gbm_bo_get_modifier(bo);
             gbm_bo_destroy(bo);
             m_fixateFormat = format;
@@ -492,15 +512,15 @@ void ScreenCastStream::addBuffer(pw_buffer *buffer)
     }
     auto entry = std::make_unique<Buffer>();
     if (m_dmabuf && (data[0].type & (1 << SPA_DATA_DmaBuf))) {
-        entry->bo = m_modifier == DRM_FORMAT_MOD_INVALID
-                ? gbm_bo_create(m_gbm, uint32_t(m_size.width()), uint32_t(m_size.height()),
-                                m_drmFormat, GBM_BO_USE_RENDERING)
-                : gbm_bo_create_with_modifiers2(m_gbm, uint32_t(m_size.width()),
-                                                uint32_t(m_size.height()), m_drmFormat,
-                                                &m_modifier, 1, GBM_BO_USE_RENDERING);
+        entry->bo = allocateDmaBuf(m_gbm, m_size, m_drmFormat, m_modifier);
         if (!entry->bo) {
-            qWarning() << "Cannot allocate a DMA-BUF for the stream";
-            finish();
+            // Withdraw DMA-BUFs and let the renegotiation replace this buffer.
+            qWarning() << "Cannot allocate a DMA-BUF for the stream; falling back to memory";
+            entry->importFailed = true;
+            m_avoidDmaBuf = true;
+            m_buffers.push_back(entry.get());
+            buffer->user_data = entry.release();
+            updateParams();
             return;
         }
         const int planes = gbm_bo_get_plane_count(entry->bo);

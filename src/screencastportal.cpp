@@ -2,7 +2,6 @@
 #include "pipewirecore.h"
 #include "screencaststream.h"
 #include "screencasttypes.h"
-#include "screenrecordingpermissions.h"
 #include "waylandcapture.h"
 
 #include <QDBusPendingCallWatcher>
@@ -121,8 +120,7 @@ class StartRequest : public QObject
 
 public:
     StartRequest(const QDBusConnection &bus, const QDBusMessage &message, const QString &path,
-                 ScreenCastSession *session, WaylandCapture *wayland, PipeWireCore *pipewire,
-                 ScreenRecordingPermissions *permissions)
+                 ScreenCastSession *session, WaylandCapture *wayland, PipeWireCore *pipewire)
         : QObject(session)
         , bus(bus)
         , message(message)
@@ -130,7 +128,6 @@ public:
         , session(session)
         , wayland(wayland)
         , pipewire(pipewire)
-        , permissions(permissions)
     {
         session->request = this;
     }
@@ -154,25 +151,16 @@ public:
                 return output.name == name;
             });
         };
-        // A standing grant with the monitors it was given for streams without
-        // asking; a window is chosen afresh every time, its identifier being
-        // good for one lifetime only.
-        const auto grant = permissions->grant(session->appId);
-        if (grant && grant->allowed && (session->types & sourceMonitor)) {
-            QStringList monitors;
-            if (!session->restore.isEmpty()
-                && std::all_of(session->restore.begin(), session->restore.end(), known))
-                monitors = session->restore;
-            else if (!grant->monitors.isEmpty()
-                     && std::all_of(grant->monitors.begin(), grant->monitors.end(), known))
-                monitors = grant->monitors;
-            if (!monitors.isEmpty()) {
-                QList<CaptureTarget> targets;
-                for (const QString &name : monitors)
-                    targets.append({CaptureTarget::Kind::Monitor, name});
-                startStreams(targets, session->persistMode);
-                return;
-            }
+        // The only thing that skips the chooser is the application's own
+        // restore token naming monitors that still exist. Windows are chosen
+        // afresh every time, their identifiers being good for one lifetime.
+        if ((session->types & sourceMonitor) && !session->restore.isEmpty()
+            && std::all_of(session->restore.begin(), session->restore.end(), known)) {
+            QList<CaptureTarget> targets;
+            for (const QString &name : session->restore)
+                targets.append({CaptureTarget::Kind::Monitor, name});
+            startStreams(targets, session->persistMode);
+            return;
         }
         QVariantList windows;
         if (session->types & sourceWindow) {
@@ -259,9 +247,6 @@ private:
     void answered(uint response, const QVariantMap &results)
     {
         if (response != 0) {
-            // A denied application still shows up in Settings, where the user
-            // can grant it later.
-            permissions->record(session->appId);
             finish(response == 1 ? 1 : 2);
             return;
         }
@@ -272,19 +257,13 @@ private:
         };
         const QStringList monitors = names("monitors");
         const QStringList windows = names("windows");
-        const bool always = results.value(QStringLiteral("always")).toBool();
-        if (always)
-            permissions->allow(session->appId, monitors);
-        else
-            permissions->record(session->appId);
         QList<CaptureTarget> targets;
         for (const QString &name : monitors)
             targets.append({CaptureTarget::Kind::Monitor, name});
         for (const QString &identifier : windows)
             targets.append({CaptureTarget::Kind::Window, identifier});
-        // An application's own restore token is only honoured while the grant
-        // stands and names monitors, so it is handed out with "always" alone.
-        startStreams(targets, always && windows.isEmpty() ? session->persistMode : persistNone);
+        // A token can only name monitors, so a window choice gets none.
+        startStreams(targets, windows.isEmpty() ? session->persistMode : persistNone);
     }
 
 private:
@@ -401,7 +380,6 @@ private:
     ScreenCastSession *session;
     WaylandCapture *wayland;
     PipeWireCore *pipewire;
-    ScreenRecordingPermissions *permissions;
     QList<ScreenCastStream *> pending;
     QList<CaptureTarget> selected;
     uint granted = persistNone;
@@ -433,7 +411,6 @@ ScreenCastPortal::ScreenCastPortal(QObject *parent, const QDBusConnection &bus)
     , m_bus(bus)
     , m_wayland(new WaylandCapture(this))
     , m_pipewire(new PipeWireCore(this))
-    , m_permissions(new ScreenRecordingPermissions(this))
 {
     registerScreenCastTypes();
 }
@@ -518,8 +495,7 @@ uint ScreenCastPortal::Start(const QDBusObjectPath &handle, const QDBusObjectPat
     if (!session || session->started
         || !handle.path().startsWith(QStringLiteral("/org/freedesktop/portal/desktop/request/")))
         return 2;
-    auto *request = new StartRequest(m_bus, message, handle.path(), session, m_wayland, m_pipewire,
-                                     m_permissions);
+    auto *request = new StartRequest(m_bus, message, handle.path(), session, m_wayland, m_pipewire);
     if (!m_bus.registerObject(handle.path(), request, QDBusConnection::ExportAllSlots)) {
         delete request;
         return 2;

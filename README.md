@@ -125,28 +125,23 @@ source per session, `Hidden` and `Embedded` cursor modes (`AvailableCursorModes`
 rounded corners, without shadow. Not supported: virtual sources and cursor
 metadata.
 
-### Permission
+### Choosing what to share
 
 `Start` asks the user through `cutefish-services`
 (`com.cutefish.Services.Permissions.Prompt`, kind `screen-recording`), which
-shows the requesting application, the displays and windows to choose from as
-the application's source types allow, and Deny, Allow Once and Always Allow. The decision is recorded in
-`~/.config/cutefish/privacy.conf` through the framework's
-`ScreenRecordingPermissions`:
+shows the requesting application and the displays and windows to choose from,
+as the application's source types allow, with Cancel and Share. There is no
+standing grant: like other Wayland desktops, the backend asks for a choice
+every time, and the application's own `restore_data` is what skips the
+chooser:
 
-- every application that has asked is listed, so Settings › Privacy can grant
-  or revoke it later;
-- Always Allow stores the grant and the chosen monitors, and the next `Start`
-  from that application streams without a prompt as long as those monitors
-  still exist. A window is chosen afresh every time: its identifier lasts one
-  window lifetime, so a grant without stored monitors (a window choice, or a
-  switch turned on in Settings) still shows the picker;
-- an application's own `restore_data` is honoured only while its grant stands,
-  and `persist_mode`/`restore_data` are only returned after Always Allow;
-- Deny closes the request with response 1, and the frontend closes the session.
-
-Applications without an app id (unsandboxed programs the frontend cannot
-identify) get Deny and Allow Once only.
+- a monitor choice is returned with `persist_mode` and `restore_data` as the
+  application requested, and a later `Start` carrying it streams those
+  monitors without asking while they still exist;
+- a window is chosen afresh every time: its identifier lasts one window
+  lifetime, so a window choice gets no `restore_data`;
+- Cancel closes the request with response 1, and the frontend closes the
+  session.
 
 The request handle accepts `Close` while the prompt is open, which dismisses
 it. The session object implements `org.freedesktop.impl.portal.Session`
@@ -194,10 +189,9 @@ their existing GTK settings-file handling.
 
 Build requirements: CMake 3.18+, a C++17 compiler, Qt 6 Core/DBus development
 packages, `libpipewire-0.3`, `wayland-client`, `wayland-scanner`,
-`wayland-protocols` 1.39+, `gbm`, `libdrm`, and the sibling `cutefish-framework` checkout (the
-permission store is built from `../cutefish-framework/privacy`). Tests
-additionally require `dbus-run-session`, Python 3, and GObject/GIO
-bindings (`python3-gi` on Debian). An installed `xdg-desktop-portal` enables the
+`wayland-protocols` 1.39+, `gbm`, and `libdrm`. Tests additionally require
+`dbus-run-session`, Python 3, and GObject/GIO bindings (`python3-gi` on
+Debian). An installed `xdg-desktop-portal` enables the
 frontend forwarding test.
 
 Run from this repository:

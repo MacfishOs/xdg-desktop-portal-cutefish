@@ -17,11 +17,6 @@ pkg_check_modules(WaylandProtocols REQUIRED wayland-protocols>=1.39)
 pkg_get_variable(WAYLAND_PROTOCOLS_DATADIR wayland-protocols pkgdatadir)
 pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
 
-# The permission store is shared with Settings through the sibling framework
-# checkout, as in the other desktop components.
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../cutefish-framework/privacy
-                 ${CMAKE_CURRENT_BINARY_DIR}/cutefish-framework-privacy-build)
-
 # Client-side marshalling for the capture protocols; generated into the build tree.
 set(PROTOCOL_DIR ${CMAKE_BINARY_DIR}/wayland-protocols)
 file(MAKE_DIRECTORY ${PROTOCOL_DIR})
@@ -63,8 +58,7 @@ portal_wayland_protocol(xdg-desktop-portal-cutefish xdg-output-unstable-v1 unsta
 portal_wayland_protocol(xdg-desktop-portal-cutefish linux-dmabuf-v1 stable/linux-dmabuf)
 target_include_directories(xdg-desktop-portal-cutefish PRIVATE ${PROTOCOL_DIR})
 target_link_libraries(xdg-desktop-portal-cutefish PRIVATE Qt6::Core Qt6::DBus
-    PkgConfig::PipeWire PkgConfig::WaylandClient PkgConfig::Gbm PkgConfig::Libdrm
-    Cutefish::Privacy)
+    PkgConfig::PipeWire PkgConfig::WaylandClient PkgConfig::Gbm PkgConfig::Libdrm)
 target_compile_definitions(xdg-desktop-portal-cutefish PRIVATE
     PROJECT_VERSION="${PROJECT_VERSION}"
     FILE_CHOOSER_HELPER="${CMAKE_INSTALL_FULL_LIBEXECDIR}/cutefish-filechooser"

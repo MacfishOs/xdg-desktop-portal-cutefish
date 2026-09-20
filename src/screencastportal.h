@@ -9,7 +9,6 @@
 
 class PipeWireCore;
 class ScreenCastSession;
-class ScreenRecordingPermissions;
 class WaylandCapture;
 
 class ScreenCastPortal : public QDBusAbstractAdaptor
@@ -47,6 +46,5 @@ private:
     QDBusConnection m_bus;
     WaylandCapture *m_wayland;
     PipeWireCore *m_pipewire;
-    ScreenRecordingPermissions *m_permissions;
     QHash<QString, ScreenCastSession *> m_sessions;
 };
