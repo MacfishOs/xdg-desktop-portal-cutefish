@@ -557,8 +557,12 @@ void ScreenCastStream::addBuffer(pw_buffer *buffer)
         entry->importPending = m_wayland->createDmaBufBuffer(
                 m_size, m_drmFormat, gbm_bo_get_modifier(entry->bo), description,
                 [this, raw, alive = entry->alive](wl_buffer *imported) {
-                    if (!*alive)
+                    if (!*alive) {
+                        // Removed before the reply; the compositor pins the planes until this goes.
+                        if (imported)
+                            wl_buffer_destroy(imported);
                         return;
+                    }
                     raw->importPending = false;
                     raw->wlBuffer = imported;
                     raw->importFailed = imported == nullptr;

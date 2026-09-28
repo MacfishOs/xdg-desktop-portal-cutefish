@@ -77,6 +77,15 @@ const zxdg_output_v1_listener xdgOutputListener = {
         [](void *, zxdg_output_v1 *, const char *) {},
         [](void *, zxdg_output_v1 *, const char *) {}};
 
+// wl_output_destroy sends nothing, which leaves the binding in the compositor.
+void releaseOutput(wl_output *output)
+{
+    if (wl_output_get_version(output) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
+        wl_output_release(output);
+    else
+        wl_output_destroy(output);
+}
+
 } // namespace
 
 struct WaylandCaptureEvents {
@@ -361,7 +370,7 @@ void WaylandCapture::handleGlobalRemove(uint32_t name)
         return;
     if ((*it)->xdgOutput)
         zxdg_output_v1_destroy((*it)->xdgOutput);
-    wl_output_destroy((*it)->proxy);
+    releaseOutput((*it)->proxy);
     m_outputs.erase(it);
     Q_EMIT outputsChanged();
 }
@@ -526,7 +535,7 @@ void WaylandCapture::disconnect()
     for (auto &output : m_outputs) {
         if (output->xdgOutput)
             zxdg_output_v1_destroy(output->xdgOutput);
-        wl_output_destroy(output->proxy);
+        releaseOutput(output->proxy);
     }
     m_outputs.clear();
     for (auto &toplevel : m_toplevels)
