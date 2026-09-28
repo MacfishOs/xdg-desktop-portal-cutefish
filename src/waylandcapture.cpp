@@ -443,22 +443,28 @@ namespace {
 
 struct PendingDmaBuf {
     std::function<void(wl_buffer *)> done;
+    std::vector<zwp_linux_buffer_params_v1 *> *pendingParams;
 };
+
+// Takes the import out of the pending list and frees its proxy and record,
+// handing back the callback to run.
+std::function<void(wl_buffer *)> finishPending(void *data, zwp_linux_buffer_params_v1 *params)
+{
+    auto *pending = static_cast<PendingDmaBuf *>(data);
+    auto &list = *pending->pendingParams;
+    list.erase(std::remove(list.begin(), list.end(), params), list.end());
+    zwp_linux_buffer_params_v1_destroy(params);
+    auto done = std::move(pending->done);
+    delete pending;
+    return done;
+}
 
 const zwp_linux_buffer_params_v1_listener paramsListener = {
         [](void *data, zwp_linux_buffer_params_v1 *params, wl_buffer *buffer) {
-            auto *pending = static_cast<PendingDmaBuf *>(data);
-            zwp_linux_buffer_params_v1_destroy(params);
-            const auto done = std::move(pending->done);
-            delete pending;
-            done(buffer);
+            finishPending(data, params)(buffer);
         },
         [](void *data, zwp_linux_buffer_params_v1 *params) {
-            auto *pending = static_cast<PendingDmaBuf *>(data);
-            zwp_linux_buffer_params_v1_destroy(params);
-            const auto done = std::move(pending->done);
-            delete pending;
-            done(nullptr);
+            finishPending(data, params)(nullptr);
         }};
 
 } // namespace
@@ -476,7 +482,8 @@ bool WaylandCapture::createDmaBufBuffer(const QSize &size, uint32_t format, uint
                                        uint32_t(modifier >> 32), uint32_t(modifier & 0xffffffff));
     }
     zwp_linux_buffer_params_v1_add_listener(params, &paramsListener,
-                                            new PendingDmaBuf {std::move(done)});
+                                            new PendingDmaBuf {std::move(done), &m_pendingParams});
+    m_pendingParams.push_back(params);
     zwp_linux_buffer_params_v1_create(params, size.width(), size.height(), format, 0);
     flush();
     return true;
@@ -496,7 +503,15 @@ wl_buffer *WaylandCapture::createShmBuffer(int fd, const QSize &size, int stride
 void WaylandCapture::flush()
 {
     if (m_display && wl_display_flush(m_display) < 0 && errno != EAGAIN)
-        disconnect();
+        scheduleDisconnect();
+}
+
+void WaylandCapture::scheduleDisconnect()
+{
+    if (m_disconnectPending || !m_display)
+        return;
+    m_disconnectPending = true;
+    QMetaObject::invokeMethod(this, &WaylandCapture::disconnect, Qt::QueuedConnection);
 }
 
 void WaylandCapture::dispatch()
@@ -525,9 +540,20 @@ void WaylandCapture::dispatch()
 
 void WaylandCapture::disconnect()
 {
+    m_disconnectPending = false;
     if (!m_display)
         return;
     qWarning() << "Lost the Wayland display used for screen capture";
+    // An import the compositor will never answer fails now, while its
+    // session is still whole.
+    const auto pending = std::move(m_pendingParams);
+    m_pendingParams.clear();
+    for (zwp_linux_buffer_params_v1 *params : pending) {
+        auto *record = static_cast<PendingDmaBuf *>(
+                wl_proxy_get_user_data(reinterpret_cast<wl_proxy *>(params)));
+        record->pendingParams = &m_pendingParams;
+        finishPending(record, params)(nullptr);
+    }
     // Sessions release their proxies while the display still exists.
     Q_EMIT disconnected();
     delete m_notifier;

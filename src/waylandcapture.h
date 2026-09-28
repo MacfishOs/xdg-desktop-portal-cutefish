@@ -61,6 +61,8 @@ class CaptureSession;
 // One connection to the compositor for the whole portal, driven from the Qt
 // event loop. It carries output enumeration and the capture globals, which the
 // compositor only announces to allowlisted executables.
+struct zwp_linux_buffer_params_v1;
+
 class WaylandCapture : public QObject
 {
     Q_OBJECT
@@ -110,6 +112,9 @@ private:
     std::unique_ptr<CaptureSession> makeSession(ext_image_capture_source_v1 *source, bool cursor);
     void dispatch();
     void disconnect();
+    // From inside a dispatch or a PipeWire callback the display cannot go
+    // yet; the disconnect runs from the event loop instead.
+    void scheduleDisconnect();
 
     wl_display *m_display = nullptr;
     wl_registry *m_registry = nullptr;
@@ -124,6 +129,9 @@ private:
     std::vector<std::unique_ptr<Output>> m_outputs;
     std::vector<std::unique_ptr<Toplevel>> m_toplevels;
     bool m_dispatching = false;
+    bool m_disconnectPending = false;
+    // DMA-BUF imports still waiting for the compositor's created or failed.
+    std::vector<zwp_linux_buffer_params_v1 *> m_pendingParams;
 };
 
 // One ext-image-copy-capture session on one source. The compositor allows a

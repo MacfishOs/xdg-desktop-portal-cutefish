@@ -7,10 +7,49 @@
 #include <QCoreApplication>
 #include <QDBusError>
 #include <QDebug>
+#include <QSocketNotifier>
+
+#include <csignal>
+
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace {
+
+int g_signalFds[2] = {-1, -1};
+
+void onSignal(int)
+{
+    const char byte = 0;
+    (void)!write(g_signalFds[0], &byte, 1);
+}
+
+// A termination signal ends the event loop instead of the process, so the
+// portals and the leak checker of a sanitizer build get their shutdown.
+void quitOnSignal(QCoreApplication *app)
+{
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, g_signalFds) != 0)
+        return;
+    auto *notifier = new QSocketNotifier(g_signalFds[1], QSocketNotifier::Read, app);
+    QObject::connect(notifier, &QSocketNotifier::activated, app, [app] {
+        char byte;
+        (void)!read(g_signalFds[1], &byte, 1);
+        app->quit();
+    });
+    struct sigaction action = {};
+    action.sa_handler = onSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &action, nullptr);
+    sigaction(SIGINT, &action, nullptr);
+}
+
+} // namespace
 
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
+    quitOnSignal(&app);
     QCoreApplication::setApplicationName(QStringLiteral("xdg-desktop-portal-cutefish"));
     QCoreApplication::setApplicationVersion(QStringLiteral(PROJECT_VERSION));
 
