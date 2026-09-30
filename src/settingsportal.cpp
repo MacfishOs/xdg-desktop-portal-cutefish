@@ -6,6 +6,7 @@
 #include <QDBusServiceWatcher>
 #include <QDebug>
 #include <QSettings>
+#include <QStandardPaths>
 
 namespace {
 const QString AppearanceService = QStringLiteral("com.cutefish.Services");
@@ -28,7 +29,10 @@ SettingsPortal::SettingsPortal(const QDBusConnection &bus, QObject *parent)
 {
     qDBusRegisterMetaType<SettingsMap>();
 
-    QSettings settings(QStringLiteral("cutefish"), QStringLiteral("theme"));
+    QSettings settings(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+                               + QStringLiteral("/cutefish/services.conf"),
+                       QSettings::IniFormat);
+    settings.beginGroup(QStringLiteral("Appearance"));
     m_colorScheme = settings.value(QStringLiteral("DarkMode"), false).toBool() ? 1u : 2u;
 
     if (!m_bus.connect(AppearanceService, AppearancePath, AppearanceInterface,

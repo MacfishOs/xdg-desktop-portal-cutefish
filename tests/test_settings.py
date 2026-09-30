@@ -108,9 +108,9 @@ class SettingsPortalTest(unittest.TestCase):
 
     def start(self, saved=None, helper=None):
         if saved is not None:
-            theme = self.config / "cutefish" / "theme.conf"
-            theme.parent.mkdir()
-            theme.write_text(f"[General]\nDarkMode={'true' if saved else 'false'}\n")
+            services = self.config / "cutefish" / "services.conf"
+            services.parent.mkdir()
+            services.write_text(f"[Appearance]\nDarkMode={'true' if saved else 'false'}\n")
         environment = dict(os.environ, XDG_CONFIG_HOME=str(self.config),
                            XDG_CONFIG_DIRS=str(self.config / "empty"))
         command = [BACKEND]

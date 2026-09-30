@@ -167,9 +167,9 @@ Cutefish Settings → com.cutefish.Services.Appearance.darkModeChanged(bool)
                  → applications consuming the system color-scheme preference
 ```
 
-At startup, the backend reads `DarkMode` from the existing Cutefish QSettings
-configuration (`$XDG_CONFIG_HOME/cutefish/theme.conf`, normally
-`~/.config/cutefish/theme.conf`). It then reads `isDarkMode` from
+At startup, the backend reads `DarkMode` from the `[Appearance]` group of
+`$XDG_CONFIG_HOME/cutefish/services.conf`, normally
+`~/.config/cutefish/services.conf`. It then reads `isDarkMode` from
 `com.cutefish.Services` at `/com/cutefish/Services/Appearance`, on interface
 `com.cutefish.Services.Appearance`. The live value takes precedence over the file.
 
@@ -177,7 +177,7 @@ Changes are forwarded immediately from the signal payload, without waiting for
 the settings file to be flushed. Duplicate values do not emit notifications.
 If Cutefish services exit, the last known preference is retained; the property
 is read again when a new service owner appears. The backend also supports starting
-before Cutefish services. Editing `theme.conf` directly while the backend runs
+before Cutefish services. Editing `services.conf` directly while the backend runs
 does not generate a notification.
 
 Applications must consume the Settings portal and follow the system preference.
