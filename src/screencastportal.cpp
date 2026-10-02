@@ -1,12 +1,12 @@
 #include "screencastportal.h"
 #include "pipewirecore.h"
+#include "requesterwatch.h"
 #include "screencaststream.h"
 #include "screencasttypes.h"
 #include "waylandcapture.h"
 
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
-#include <QDBusServiceWatcher>
 #include <QDebug>
 #include <QStringList>
 
@@ -22,6 +22,12 @@ constexpr uint cursorEmbedded = 2;
 constexpr uint persistNone = 0;
 constexpr uint persistUntilRevoked = 2;
 
+QStringList stringList(const QVariant &value)
+{
+    return value.canConvert<QDBusArgument>() ? qdbus_cast<QStringList>(value)
+                                             : value.toStringList();
+}
+
 QStringList restoredMonitors(const QVariant &value)
 {
     if (!value.canConvert<QDBusArgument>())
@@ -32,9 +38,7 @@ QStringList restoredMonitors(const QVariant &value)
     const QVariant payload = data.data.variant();
     const QVariantMap map = payload.canConvert<QDBusArgument>() ? qdbus_cast<QVariantMap>(payload)
                                                                 : payload.toMap();
-    const QVariant monitors = map.value(QStringLiteral("monitors"));
-    return monitors.canConvert<QDBusArgument>() ? qdbus_cast<QStringList>(monitors)
-                                                : monitors.toStringList();
+    return stringList(map.value(QStringLiteral("monitors")));
 }
 
 QVariant restoreData(const QStringList &monitors)
@@ -49,6 +53,22 @@ QVariant restoreData(const QStringList &monitors)
 int framerateFor(const CaptureOutput &output)
 {
     return output.refreshMilliHz > 0 ? int(std::ceil(output.refreshMilliHz / 1000.0)) : 60;
+}
+
+const CaptureOutput *findOutput(const QList<CaptureOutput> &outputs, const QString &name)
+{
+    const auto it = std::find_if(outputs.begin(), outputs.end(), [&](const CaptureOutput &output) {
+        return output.name == name;
+    });
+    return it != outputs.end() ? &*it : nullptr;
+}
+
+QDBusMessage permissionsCall(const QString &method)
+{
+    return QDBusMessage::createMethodCall(QStringLiteral("com.cutefish.Services"),
+                                          QStringLiteral("/com/cutefish/Services/Permissions"),
+                                          QStringLiteral("com.cutefish.Services.Permissions"),
+                                          method);
 }
 
 } // namespace
@@ -70,9 +90,7 @@ public:
         , owner(owner)
         , appId(appId)
     {
-        auto *watcher = new QDBusServiceWatcher(owner, bus,
-                                                QDBusServiceWatcher::WatchForUnregistration, this);
-        connect(watcher, &QDBusServiceWatcher::serviceUnregistered, this, [this] {
+        watchRequester(this, bus, owner, [this] {
             close(false);
         });
     }
@@ -102,8 +120,6 @@ public:
     QString appId;
     uint cursorMode = cursorHidden;
     uint persistMode = persistNone;
-    bool multiple = false;
-    bool sourcesSelected = false;
     bool started = false;
     bool closed = false;
     uint types = sourceMonitor;
@@ -147,9 +163,7 @@ public:
             return;
         }
         const auto known = [&](const QString &name) {
-            return std::any_of(outputs.begin(), outputs.end(), [&](const CaptureOutput &output) {
-                return output.name == name;
-            });
+            return findOutput(outputs, name) != nullptr;
         };
         // The only thing that skips the chooser is the application's own
         // restore token naming monitors that still exist. Windows are chosen
@@ -179,10 +193,7 @@ public:
                                          {QStringLiteral("width"), output.logicalSize.width()},
                                          {QStringLiteral("height"), output.logicalSize.height()}});
         }
-        auto call = QDBusMessage::createMethodCall(
-                QStringLiteral("com.cutefish.Services"),
-                QStringLiteral("/com/cutefish/Services/Permissions"),
-                QStringLiteral("com.cutefish.Services.Permissions"), QStringLiteral("Prompt"));
+        auto call = permissionsCall(QStringLiteral("Prompt"));
         QVariantMap options {{QStringLiteral("types"), session->types}};
         if (session->types & sourceMonitor)
             options.insert(QStringLiteral("monitors"), monitors);
@@ -217,10 +228,7 @@ public:
         bus.unregisterObject(path);
         bus.send(message.createReply({response, results}));
         if (prompting) {
-            auto call = QDBusMessage::createMethodCall(
-                    QStringLiteral("com.cutefish.Services"),
-                    QStringLiteral("/com/cutefish/Services/Permissions"),
-                    QStringLiteral("com.cutefish.Services.Permissions"), QStringLiteral("Dismiss"));
+            auto call = permissionsCall(QStringLiteral("Dismiss"));
             call.setArguments({path});
             bus.asyncCall(call);
         }
@@ -250,13 +258,8 @@ private:
             finish(response == 1 ? 1 : 2);
             return;
         }
-        const auto names = [&](const char *key) {
-            const QVariant chosen = results.value(QLatin1String(key));
-            return chosen.canConvert<QDBusArgument>() ? qdbus_cast<QStringList>(chosen)
-                                                      : chosen.toStringList();
-        };
-        const QStringList monitors = names("monitors");
-        const QStringList windows = names("windows");
+        const QStringList monitors = stringList(results.value(QStringLiteral("monitors")));
+        const QStringList windows = stringList(results.value(QStringLiteral("windows")));
         QList<CaptureTarget> targets;
         for (const QString &name : monitors)
             targets.append({CaptureTarget::Kind::Monitor, name});
@@ -279,13 +282,10 @@ private:
         for (const auto &target : targets) {
             int framerate = windowFramerate;
             if (target.kind == CaptureTarget::Kind::Monitor) {
-                const auto it =
-                        std::find_if(outputs.begin(), outputs.end(), [&](const auto &output) {
-                            return output.name == target.name;
-                        });
-                if (it == outputs.end())
+                const CaptureOutput *output = findOutput(outputs, target.name);
+                if (!output)
                     continue;
-                framerate = framerateFor(*it);
+                framerate = framerateFor(*output);
             } else if (std::none_of(toplevels.begin(), toplevels.end(), [&](const auto &toplevel) {
                            return toplevel.identifier == target.name;
                        })) {
@@ -306,6 +306,9 @@ private:
             connect(stream, &ScreenCastStream::ready, this, [this] {
                 deliver();
             });
+            connect(stream, &ScreenCastStream::stopped, this, [this] {
+                finish(2);
+            });
             if (!stream->start()) {
                 finish(2);
                 return;
@@ -316,7 +319,6 @@ private:
             return;
         }
         granted = persist;
-        this->selected = selected;
     }
 
     void deliver()
@@ -331,22 +333,18 @@ private:
         QList<StreamInfo> streams;
         QStringList monitors;
         for (auto *stream : pending) {
-            const CaptureTarget &target = selected.at(streams.size());
+            const CaptureTarget &target = stream->target();
             QVariantMap properties;
             if (target.kind == CaptureTarget::Kind::Monitor) {
                 monitors.append(target.name);
                 properties.insert(QStringLiteral("source_type"), sourceMonitor);
-                const auto it =
-                        std::find_if(outputs.begin(), outputs.end(), [&](const auto &output) {
-                            return output.name == target.name;
-                        });
-                if (it != outputs.end()) {
+                if (const CaptureOutput *output = findOutput(outputs, target.name)) {
                     properties.insert(QStringLiteral("position"),
-                                      QVariant::fromValue(IntPair {it->logicalPosition.x(),
-                                                                   it->logicalPosition.y()}));
+                                      QVariant::fromValue(IntPair {output->logicalPosition.x(),
+                                                                   output->logicalPosition.y()}));
                     properties.insert(QStringLiteral("size"),
-                                      QVariant::fromValue(IntPair {it->logicalSize.width(),
-                                                                   it->logicalSize.height()}));
+                                      QVariant::fromValue(IntPair {output->logicalSize.width(),
+                                                                   output->logicalSize.height()}));
                 }
             } else {
                 properties.insert(QStringLiteral("source_type"), sourceWindow);
@@ -381,7 +379,6 @@ private:
     WaylandCapture *wayland;
     PipeWireCore *pipewire;
     QList<ScreenCastStream *> pending;
-    QList<CaptureTarget> selected;
     uint granted = persistNone;
     bool prompting = false;
     bool finished = false;
@@ -417,9 +414,9 @@ ScreenCastPortal::ScreenCastPortal(QObject *parent, const QDBusConnection &bus)
 
 ScreenCastPortal::~ScreenCastPortal()
 {
-    // Streams go before the connections they use.
-    for (auto *session : std::as_const(m_sessions))
-        delete session;
+    // Streams go before the connections they use. Each deletion removes its
+    // entry from m_sessions, so the deletions run over a copy.
+    qDeleteAll(m_sessions.values());
 }
 
 ScreenCastSession *ScreenCastPortal::session(const QDBusObjectPath &handle,
@@ -477,9 +474,7 @@ uint ScreenCastPortal::SelectSources(const QDBusObjectPath &handle,
     session->types = types & availableSourceTypes();
     session->cursorMode = cursorMode;
     session->persistMode = persistMode;
-    session->multiple = options.value(QStringLiteral("multiple"), false).toBool();
     session->restore = restoredMonitors(options.value(QStringLiteral("restore_data")));
-    session->sourcesSelected = true;
     return 0;
 }
 

@@ -29,6 +29,7 @@ struct ext_foreign_toplevel_image_capture_source_manager_v1;
 struct ext_foreign_toplevel_list_v1;
 struct ext_foreign_toplevel_handle_v1;
 struct zwp_linux_dmabuf_v1;
+struct zwp_linux_buffer_params_v1;
 
 class QSocketNotifier;
 
@@ -37,7 +38,6 @@ struct CaptureOutput {
     QString description;
     QPoint logicalPosition;
     QSize logicalSize;
-    QSize pixelSize;
     int refreshMilliHz = 0;
 };
 
@@ -61,8 +61,6 @@ class CaptureSession;
 // One connection to the compositor for the whole portal, driven from the Qt
 // event loop. It carries output enumeration and the capture globals, which the
 // compositor only announces to allowlisted executables.
-struct zwp_linux_buffer_params_v1;
-
 class WaylandCapture : public QObject
 {
     Q_OBJECT
@@ -76,7 +74,6 @@ public:
 
     // Connects on first use; a broken connection is dropped and retried here.
     bool connectToDisplay();
-    bool connected() const { return m_display != nullptr; }
     bool captureAvailable() const;
 
     QList<CaptureOutput> outputs() const;
@@ -97,8 +94,6 @@ public:
     void flush();
 
 Q_SIGNALS:
-    void outputsChanged();
-    void toplevelsChanged();
     void disconnected();
 
 private:
@@ -145,8 +140,6 @@ public:
 
     ~CaptureSession() override;
 
-    bool ready() const { return m_ready; }
-    bool isStopped() const { return m_stopped; }
     QSize bufferSize() const { return m_size; }
     bool argbSupported() const { return m_argb; }
     // DRM fourcc to modifiers the compositor renders into, with the device
@@ -183,7 +176,6 @@ private:
     DmaBufFormats m_dmabufFormats;
     dev_t m_pendingDmabufDevice = 0;
     dev_t m_dmabufDevice = 0;
-    bool m_ready = false;
     bool m_stopped = false;
     uint32_t m_transform = 0;
     uint64_t m_presentationNs = 0;

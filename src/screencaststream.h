@@ -50,6 +50,7 @@ public:
     bool start();
     uint32_t nodeId() const { return m_nodeId; }
     QSize size() const { return m_size; }
+    const CaptureTarget &target() const { return m_target; }
 
 Q_SIGNALS:
     // Exactly one of these fires before the node id is known.
@@ -63,7 +64,7 @@ private:
     friend struct ScreenCastStreamEvents;
 
     bool connectStream();
-    void updateParams();
+    void updateParams(bool fixate = false);
     void buildFormats(spa_pod_builder *builder, std::vector<const spa_pod *> &params,
                       bool fixate) const;
     bool openGbm();
@@ -89,6 +90,8 @@ private:
     pw_stream *m_stream = nullptr;
     spa_hook *m_listener = nullptr;
     QSize m_size;
+    // The negotiated format's size; buffers follow it, never a newer m_size.
+    QSize m_formatSize;
     uint32_t m_nodeId = 0;
     bool m_announced = false;
     bool m_streaming = false;
@@ -110,8 +113,7 @@ private:
     int m_failures = 0;
     uint32_t m_drmFormat = 0;
     uint64_t m_modifier = 0;
-    // Set by chooseModifier() while a DONT_FIXATE choice is being fixated.
-    bool m_fixating = false;
+    // What chooseModifier() settled a DONT_FIXATE choice on.
     uint32_t m_fixateFormat = 0;
     uint64_t m_fixateModifier = 0;
 };

@@ -43,6 +43,7 @@ add_executable(xdg-desktop-portal-cutefish
     src/filechoosertypes.h
     src/pipewirecore.cpp
     src/pipewirecore.h
+    src/requesterwatch.h
     src/screencastportal.cpp
     src/screencastportal.h
     src/screencaststream.cpp

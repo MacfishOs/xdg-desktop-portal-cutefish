@@ -96,6 +96,14 @@ class SettingsPortalTest(unittest.TestCase):
     def owned(self, service=SERVICE):
         return self.bus_call("NameHasOwner", GLib.Variant("(s)", (service,))).unpack()[0]
 
+    def connection(self):
+        connection = Gio.DBusConnection.new_for_address_sync(
+            os.environ["DBUS_SESSION_BUS_ADDRESS"],
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+            Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        self.addCleanup(lambda: None if connection.is_closed() else connection.close_sync(None))
+        return connection
+
     def own_source(self, dark):
         self.dark = dark
         result = self.bus_call("RequestName", GLib.Variant("(su)", (SOURCE_SERVICE, 4)))

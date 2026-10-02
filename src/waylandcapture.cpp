@@ -45,7 +45,6 @@ const wl_output_listener outputListener = {
             auto *output = static_cast<WaylandCapture::Output *>(data);
             if (!(flags & WL_OUTPUT_MODE_CURRENT))
                 return;
-            output->pending.pixelSize = QSize(width, height);
             output->pending.refreshMilliHz = refresh;
             if (!output->xdgOutput)
                 output->pending.logicalSize = QSize(width, height);
@@ -112,8 +111,6 @@ struct WaylandCaptureEvents {
     {
         auto *toplevel = static_cast<WaylandCapture::Toplevel *>(data);
         toplevel->closed = true;
-        // Handles are freed by the list on the next change; announce now.
-        toplevel->done = false;
     }
 
     static void done(void *data, ext_foreign_toplevel_handle_v1 *)
@@ -182,7 +179,6 @@ struct CaptureSessionEvents {
         session->m_argb = session->m_pendingArgb;
         session->m_dmabufDevice = session->m_pendingDmabufDevice;
         session->m_dmabufFormats = session->m_pendingDmabufFormats;
-        session->m_ready = true;
         Q_EMIT session->constraintsChanged();
     }
 
@@ -334,8 +330,7 @@ void WaylandCapture::handleGlobal(uint32_t name, const char *interface, uint32_t
 
 void WaylandCapture::addToplevel(ext_foreign_toplevel_handle_v1 *handle)
 {
-    // A closed window's handle is dropped once a new one arrives, which is
-    // also when the change is worth announcing.
+    // A closed window's handle is dropped once a new one arrives.
     for (auto it = m_toplevels.begin(); it != m_toplevels.end();) {
         if ((*it)->closed) {
             ext_foreign_toplevel_handle_v1_destroy((*it)->handle);
@@ -348,7 +343,6 @@ void WaylandCapture::addToplevel(ext_foreign_toplevel_handle_v1 *handle)
     toplevel->handle = handle;
     ext_foreign_toplevel_handle_v1_add_listener(handle, &toplevelListener, toplevel.get());
     m_toplevels.push_back(std::move(toplevel));
-    Q_EMIT toplevelsChanged();
 }
 
 QList<CaptureToplevel> WaylandCapture::toplevels() const
@@ -372,7 +366,6 @@ void WaylandCapture::handleGlobalRemove(uint32_t name)
         zxdg_output_v1_destroy((*it)->xdgOutput);
     releaseOutput((*it)->proxy);
     m_outputs.erase(it);
-    Q_EMIT outputsChanged();
 }
 
 void WaylandCapture::bindXdgOutputs()
@@ -546,12 +539,10 @@ void WaylandCapture::disconnect()
     qWarning() << "Lost the Wayland display used for screen capture";
     // An import the compositor will never answer fails now, while its
     // session is still whole.
-    const auto pending = std::move(m_pendingParams);
-    m_pendingParams.clear();
+    const auto pending = std::exchange(m_pendingParams, {});
     for (zwp_linux_buffer_params_v1 *params : pending) {
         auto *record = static_cast<PendingDmaBuf *>(
                 wl_proxy_get_user_data(reinterpret_cast<wl_proxy *>(params)));
-        record->pendingParams = &m_pendingParams;
         finishPending(record, params)(nullptr);
     }
     // Sessions release their proxies while the display still exists.
@@ -592,8 +583,6 @@ void WaylandCapture::disconnect()
     m_shm = nullptr;
     m_registry = nullptr;
     m_display = nullptr;
-    Q_EMIT outputsChanged();
-    Q_EMIT toplevelsChanged();
 }
 
 CaptureSession::CaptureSession(WaylandCapture *wayland, ext_image_copy_capture_session_v1 *session)

@@ -1,14 +1,13 @@
 #include "filechooserportal.h"
 #include "filechoosertypes.h"
+#include "requesterwatch.h"
 
-#include <QDBusServiceWatcher>
 #include <QDebug>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
-#include <QTimer>
 #include <QUrl>
 
 namespace {
@@ -42,9 +41,7 @@ public:
         , message(message)
         , path(path)
     {
-        auto *watcher = new QDBusServiceWatcher(message.service(), bus,
-                                                QDBusServiceWatcher::WatchForUnregistration, this);
-        connect(watcher, &QDBusServiceWatcher::serviceUnregistered, this, [this] {
+        watchRequester(this, bus, message.service(), [this] {
             finish(1);
         });
         process.setProcessChannelMode(QProcess::ForwardedErrorChannel);
@@ -59,55 +56,7 @@ public:
             if (output.size() > 1024 * 1024)
                 finish(2);
         });
-        connect(&process, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
-            if (finished)
-                return;
-            output += process.readAllStandardOutput();
-            const auto document = QJsonDocument::fromJson(output);
-            if (code != 0 || status != QProcess::NormalExit || !document.isObject()) {
-                finish(2);
-                return;
-            }
-            const auto reply = document.object();
-            const int response = reply.value("response").toInt(2);
-            if (response != 0) {
-                finish(response == 1 ? 1 : 2);
-                return;
-            }
-            QStringList uris;
-            for (const auto &entry : reply.value("uris").toArray()) {
-                const QUrl url(entry.toString());
-                if (!url.isLocalFile() || !url.host().isEmpty() || !url.path().startsWith('/')) {
-                    finish(2);
-                    return;
-                }
-                uris.append(url.toString(QUrl::FullyEncoded));
-            }
-            if (uris.isEmpty() || (single && uris.size() != 1)) {
-                finish(2);
-                return;
-            }
-            QVariantMap results {{"uris", uris}};
-            const int filterIndex = reply.value("filter_index").toInt(-1);
-            if (filterIndex >= 0 && filterIndex < filters.size())
-                results.insert("current_filter", QVariant::fromValue(filters.at(filterIndex)));
-            QList<ChoiceOption> selected;
-            const auto values = reply.value("choices").toObject();
-            for (const auto &choice : choices) {
-                const QString value = values.value(choice.id).toString();
-                bool valid = choice.options.isEmpty() && (value == "true" || value == "false");
-                for (const auto &option : choice.options)
-                    valid |= option.id == value;
-                if (!valid) {
-                    finish(2);
-                    return;
-                }
-                selected.append({choice.id, value});
-            }
-            if (!choices.isEmpty())
-                results.insert("choices", QVariant::fromValue(selected));
-            finish(0, results);
-        });
+        connect(&process, &QProcess::finished, this, &FileChooserRequest::readReply);
     }
 
     ~FileChooserRequest() override
@@ -141,6 +90,58 @@ public slots:
             return;
         }
         finish(1);
+    }
+
+private:
+    void readReply(int code, QProcess::ExitStatus status)
+    {
+        if (finished)
+            return;
+        output += process.readAllStandardOutput();
+        const auto document = QJsonDocument::fromJson(output);
+        if (code != 0 || status != QProcess::NormalExit || !document.isObject()) {
+            finish(2);
+            return;
+        }
+        const auto reply = document.object();
+        const int response = reply.value("response").toInt(2);
+        if (response != 0) {
+            finish(response == 1 ? 1 : 2);
+            return;
+        }
+        QStringList uris;
+        for (const auto &entry : reply.value("uris").toArray()) {
+            const QUrl url(entry.toString());
+            if (!url.isLocalFile() || !url.host().isEmpty() || !url.path().startsWith('/')) {
+                finish(2);
+                return;
+            }
+            uris.append(url.toString(QUrl::FullyEncoded));
+        }
+        if (uris.isEmpty() || (single && uris.size() != 1)) {
+            finish(2);
+            return;
+        }
+        QVariantMap results {{"uris", uris}};
+        const int filterIndex = reply.value("filter_index").toInt(-1);
+        if (filterIndex >= 0 && filterIndex < filters.size())
+            results.insert("current_filter", QVariant::fromValue(filters.at(filterIndex)));
+        QList<ChoiceOption> selected;
+        const auto values = reply.value("choices").toObject();
+        for (const auto &choice : choices) {
+            const QString value = values.value(choice.id).toString();
+            bool valid = choice.options.isEmpty() && (value == "true" || value == "false");
+            for (const auto &option : choice.options)
+                valid |= option.id == value;
+            if (!valid) {
+                finish(2);
+                return;
+            }
+            selected.append({choice.id, value});
+        }
+        if (!choices.isEmpty())
+            results.insert("choices", QVariant::fromValue(selected));
+        finish(0, results);
     }
 
 public:
@@ -209,15 +210,16 @@ uint FileChooserPortal::choose(const QString &mode, const QDBusObjectPath &handl
         return 2;
     }
     message.setDelayedReply(true);
+    const auto preferredFilter = qdbus_cast<FileFilter>(options.value("current_filter"));
     request->filters = qdbus_cast<QList<FileFilter>>(options.value("filters"));
     if (request->filters.isEmpty() && options.contains("current_filter"))
-        request->filters.append(qdbus_cast<FileFilter>(options.value("current_filter")));
+        request->filters.append(preferredFilter);
     request->choices = qdbus_cast<QList<FileChoice>>(options.value("choices"));
     request->single =
             mode == "SaveFile" || (mode == "OpenFile" && !options.value("multiple").toBool());
     QJsonArray filters;
     int currentFilter = 0;
-    const auto preferred = filterJson(qdbus_cast<FileFilter>(options.value("current_filter")));
+    const auto preferred = filterJson(preferredFilter);
     for (const auto &filter : request->filters) {
         const auto json = filterJson(filter);
         if (json == preferred)

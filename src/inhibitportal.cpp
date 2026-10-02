@@ -1,10 +1,10 @@
 #include "inhibitportal.h"
+#include "requesterwatch.h"
 
 #include <QDBusConnectionInterface>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDBusReply>
-#include <QDBusServiceWatcher>
 
 namespace {
 void error(const QDBusConnection &bus, const QDBusMessage &message, const QString &name,
@@ -29,9 +29,7 @@ public:
         , m_path(path)
         , m_owner(owner)
     {
-        auto *watcher = new QDBusServiceWatcher(message.service(), bus,
-                                                QDBusServiceWatcher::WatchForUnregistration, this);
-        connect(watcher, &QDBusServiceWatcher::serviceUnregistered, this, [this] {
+        watchRequester(this, bus, message.service(), [this] {
             close();
         });
     }

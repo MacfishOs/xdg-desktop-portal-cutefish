@@ -5,7 +5,6 @@ No compositor or PipeWire is reachable here (run_session.py isolates
 XDG_RUNTIME_DIR), so Start can only fail cleanly; streaming is verified
 against a live session."""
 
-import os
 import subprocess
 import unittest
 
@@ -25,6 +24,7 @@ class ScreenCastPortalTest(unittest.TestCase):
     call = support.SettingsPortalTest.call
     bus_call = support.SettingsPortalTest.bus_call
     owned = support.SettingsPortalTest.owned
+    connection = support.SettingsPortalTest.connection
 
     def setUp(self):
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -40,14 +40,6 @@ class ScreenCastPortalTest(unittest.TestCase):
         self.process.terminate()
         self.process.wait(timeout=5)
         self.bus.signal_unsubscribe(self.subscription)
-
-    def connection(self):
-        connection = Gio.DBusConnection.new_for_address_sync(
-            os.environ["DBUS_SESSION_BUS_ADDRESS"],
-            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
-            Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
-        self.addCleanup(lambda: None if connection.is_closed() else connection.close_sync(None))
-        return connection
 
     def create(self, name, app=APP):
         return self.call(INTERFACE, "CreateSession",

@@ -26,6 +26,7 @@ class InhibitPortalTest(unittest.TestCase):
     call = support.SettingsPortalTest.call
     bus_call = support.SettingsPortalTest.bus_call
     owned = support.SettingsPortalTest.owned
+    connection = support.SettingsPortalTest.connection
 
     def setUp(self):
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -71,14 +72,6 @@ class InhibitPortalTest(unittest.TestCase):
 
     def close(self, name):
         return self.call("org.freedesktop.impl.portal.Request", "Close", path=REQUEST + name)
-
-    def connection(self):
-        connection = Gio.DBusConnection.new_for_address_sync(
-            os.environ["DBUS_SESSION_BUS_ADDRESS"],
-            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
-            Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
-        self.addCleanup(lambda: None if connection.is_closed() else connection.close_sync(None))
-        return connection
 
     def test_multiple_requests_close_and_duplicate_path(self):
         self.assertEqual(self.inhibit("one").unpack(), ())

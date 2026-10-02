@@ -22,9 +22,7 @@ public:
 
     // Connects on first use; after a daemon error the next call reconnects.
     bool connectToDaemon();
-    bool connected() const { return m_core != nullptr; }
     pw_core *core() const { return m_core; }
-    pw_loop *loop() const { return m_loop; }
 
     // Drops the connection after notifying streams; the next connectToDaemon()
     // starts over.

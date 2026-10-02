@@ -8,6 +8,8 @@
 #include <QSettings>
 #include <QStandardPaths>
 
+#include <algorithm>
+
 namespace {
 const QString AppearanceService = QStringLiteral("com.cutefish.Services");
 const QString AppearancePath = QStringLiteral("/com/cutefish/Services/Appearance");
@@ -53,12 +55,9 @@ SettingsPortal::SettingsPortal(const QDBusConnection &bus, QObject *parent)
 
 SettingsMap SettingsPortal::ReadAll(const QStringList &namespaces) const
 {
-    if (namespaces.isEmpty())
+    if (namespaces.isEmpty()
+        || std::any_of(namespaces.cbegin(), namespaces.cend(), matchesNamespace)) {
         return {{AppearanceNamespace, {{ColorSchemeKey, m_colorScheme}}}};
-
-    for (const QString &pattern : namespaces) {
-        if (matchesNamespace(pattern))
-            return {{AppearanceNamespace, {{ColorSchemeKey, m_colorScheme}}}};
     }
     return {};
 }

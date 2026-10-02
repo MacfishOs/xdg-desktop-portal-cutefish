@@ -2,7 +2,6 @@
 
 #include <QDebug>
 #include <QSocketNotifier>
-#include <QTimer>
 
 #include <pipewire/pipewire.h>
 
