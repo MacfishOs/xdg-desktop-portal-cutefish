@@ -55,9 +55,6 @@ int main(int argc, char *argv[])
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("Cutefish desktop portal backend"));
-    parser.addOption({QStringLiteral("file-chooser-helper"),
-                      QStringLiteral("File Manager chooser executable"), QStringLiteral("path"),
-                      QStringLiteral(FILE_CHOOSER_HELPER)});
     parser.addHelpOption();
     parser.addVersionOption();
     parser.process(app);
@@ -73,7 +70,7 @@ int main(int argc, char *argv[])
 
     SettingsPortal settings(bus);
     new InhibitPortal(&settings, bus);
-    new FileChooserPortal(&settings, bus, parser.value(QStringLiteral("file-chooser-helper")));
+    new FileChooserPortal(&settings, bus);
     new ScreenCastPortal(&settings, bus);
     if (!bus.registerObject(QStringLiteral("/org/freedesktop/portal/desktop"), &settings,
                             QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals

@@ -13,7 +13,7 @@ class FileChooserPortal : public QDBusAbstractAdaptor
     Q_PROPERTY(uint version READ version CONSTANT)
 
 public:
-    FileChooserPortal(QObject *parent, const QDBusConnection &bus, const QString &helper);
+    FileChooserPortal(QObject *parent, const QDBusConnection &bus);
 
     uint version() const { return 4; }
 
@@ -34,5 +34,4 @@ private:
                 const QDBusMessage &message);
 
     QDBusConnection m_bus;
-    QString m_helper;
 };

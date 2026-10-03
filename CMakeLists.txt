@@ -62,7 +62,6 @@ target_link_libraries(xdg-desktop-portal-cutefish PRIVATE Qt6::Core Qt6::DBus
     PkgConfig::PipeWire PkgConfig::WaylandClient PkgConfig::Gbm PkgConfig::Libdrm)
 target_compile_definitions(xdg-desktop-portal-cutefish PRIVATE
     PROJECT_VERSION="${PROJECT_VERSION}"
-    FILE_CHOOSER_HELPER="${CMAKE_INSTALL_FULL_LIBEXECDIR}/cutefish-filechooser"
 )
 
 configure_file(data/org.freedesktop.impl.portal.desktop.cutefish.service.in

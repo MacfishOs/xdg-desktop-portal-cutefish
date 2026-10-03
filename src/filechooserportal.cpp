@@ -2,15 +2,21 @@
 #include "filechoosertypes.h"
 #include "requesterwatch.h"
 
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
 #include <QDebug>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QProcess>
 #include <QUrl>
 
+#include <limits>
+
 namespace {
+const QString chooserService = QStringLiteral("com.cutefish.FileChooser");
+const QString chooserPath = QStringLiteral("/com/cutefish/FileChooser");
+
 QJsonObject filterJson(const FileFilter &filter)
 {
     QJsonArray rules;
@@ -44,27 +50,31 @@ public:
         watchRequester(this, bus, message.service(), [this] {
             finish(1);
         });
-        process.setProcessChannelMode(QProcess::ForwardedErrorChannel);
-        connect(&process, &QProcess::errorOccurred, this, [this] {
-            if (finished)
-                return;
-            qWarning() << "File Manager chooser failed:" << process.errorString();
-            finish(2);
-        });
-        connect(&process, &QProcess::readyReadStandardOutput, this, [this] {
-            output += process.readAllStandardOutput();
-            if (output.size() > 1024 * 1024)
-                finish(2);
-        });
-        connect(&process, &QProcess::finished, this, &FileChooserRequest::readReply);
     }
 
-    ~FileChooserRequest() override
+    void start(const QByteArray &payload)
     {
-        if (process.state() != QProcess::NotRunning) {
-            process.kill();
-            process.waitForFinished(1000);
-        }
+        // The session's file manager daemon shows the dialog; the session
+        // restarts it when it dies, so nothing else is started for it.
+        QDBusMessage call = QDBusMessage::createMethodCall(chooserService, chooserPath,
+                                                           chooserService, QStringLiteral("Open"));
+        call << path << QString::fromUtf8(payload);
+        call.setAutoStartService(false);
+        // The dialog stays open as long as the user leaves it.
+        auto *watcher = new QDBusPendingCallWatcher(
+                bus.asyncCall(call, std::numeric_limits<int>::max()), this);
+        open = true;
+        connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher] {
+            watcher->deleteLater();
+            open = false;
+            const QDBusPendingReply<QString> reply = *watcher;
+            if (reply.isError()) {
+                qWarning() << "File Manager chooser failed:" << reply.error().message();
+                finish(2);
+                return;
+            }
+            readResult(reply.value().toUtf8());
+        });
     }
 
     void finish(uint response, const QVariantMap &results = {})
@@ -72,10 +82,15 @@ public:
         if (finished)
             return;
         finished = true;
+        if (open) {
+            QDBusMessage close = QDBusMessage::createMethodCall(
+                    chooserService, chooserPath, chooserService, QStringLiteral("Close"));
+            close << path;
+            close.setAutoStartService(false);
+            bus.send(close);
+        }
         bus.unregisterObject(path);
         bus.send(message.createReply({response, results}));
-        if (process.state() != QProcess::NotRunning)
-            process.kill();
         deleteLater();
     }
 
@@ -93,13 +108,12 @@ public slots:
     }
 
 private:
-    void readReply(int code, QProcess::ExitStatus status)
+    void readResult(const QByteArray &result)
     {
         if (finished)
             return;
-        output += process.readAllStandardOutput();
-        const auto document = QJsonDocument::fromJson(output);
-        if (code != 0 || status != QProcess::NormalExit || !document.isObject()) {
+        const auto document = QJsonDocument::fromJson(result);
+        if (result.size() > 1024 * 1024 || !document.isObject()) {
             finish(2);
             return;
         }
@@ -148,19 +162,16 @@ public:
     QDBusConnection bus;
     QDBusMessage message;
     QString path;
-    QProcess process;
-    QByteArray output;
     QList<FileFilter> filters;
     QList<FileChoice> choices;
     bool single = true;
+    bool open = false;
     bool finished = false;
 };
 
-FileChooserPortal::FileChooserPortal(QObject *parent, const QDBusConnection &bus,
-                                     const QString &helper)
+FileChooserPortal::FileChooserPortal(QObject *parent, const QDBusConnection &bus)
     : QDBusAbstractAdaptor(parent)
     , m_bus(bus)
-    , m_helper(helper)
 {
     qDBusRegisterMetaType<FilterRule>();
     qDBusRegisterMetaType<QList<FilterRule>>();
@@ -254,11 +265,7 @@ uint FileChooserPortal::choose(const QString &mode, const QDBusObjectPath &handl
                                {"filter_index", currentFilter},
                                {"choices", choices},
                                {"files", files}};
-    connect(&request->process, &QProcess::started, request, [request, payload] {
-        request->process.write(QJsonDocument(payload).toJson(QJsonDocument::Compact));
-        request->process.closeWriteChannel();
-    });
-    request->process.start(m_helper, {});
+    request->start(QJsonDocument(payload).toJson(QJsonDocument::Compact));
     return 0;
 }
 

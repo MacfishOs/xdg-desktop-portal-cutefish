@@ -25,6 +25,13 @@ SOURCE_XML = f"""<node><interface name="{SOURCE_INTERFACE}">
   <property name="isDarkMode" type="b" access="read"/>
   <signal name="darkModeChanged"><arg type="b"/></signal>
 </interface></node>"""
+CHOOSER_SERVICE = "com.cutefish.FileChooser"
+CHOOSER_PATH = "/com/cutefish/FileChooser"
+CHOOSER_XML = f"""<node><interface name="{CHOOSER_SERVICE}">
+  <method name="Open"><arg type="s" direction="in"/><arg type="s" direction="in"/>
+    <arg type="s" direction="out"/></method>
+  <method name="Close"><arg type="s" direction="in"/></method>
+</interface></node>"""
 
 
 def spin_until(predicate, timeout=5):
@@ -114,17 +121,14 @@ class SettingsPortalTest(unittest.TestCase):
         self.bus_call("ReleaseName", GLib.Variant("(s)", (SOURCE_SERVICE,)))
         self.source_owned = False
 
-    def start(self, saved=None, helper=None):
+    def start(self, saved=None):
         if saved is not None:
             services = self.config / "cutefish" / "services.conf"
             services.parent.mkdir()
             services.write_text(f"[Appearance]\nDarkMode={'true' if saved else 'false'}\n")
         environment = dict(os.environ, XDG_CONFIG_HOME=str(self.config),
                            XDG_CONFIG_DIRS=str(self.config / "empty"))
-        command = [BACKEND]
-        if helper:
-            command += ["--file-chooser-helper", str(helper)]
-        self.process = subprocess.Popen(command, env=environment)
+        self.process = subprocess.Popen([BACKEND], env=environment)
         spin_until(self.owned)
         self.assertIsNone(self.process.poll())
 
@@ -228,18 +232,31 @@ class SettingsPortalTest(unittest.TestCase):
         self.assertIn(b"Cannot own", second.stderr)
         self.assertEqual(self.read(), 2)
 
-    def chooser_helper(self, reply, wait=False):
-        helper = self.config / "chooser-helper"
-        self.helper_input = self.config / "request.json"
-        helper.write_text(
-            "#!/usr/bin/python3\nimport json, sys, time\n"
-            f"with open({str(self.helper_input)!r}, 'w') as out:\n"
-            "    json.dump(json.load(sys.stdin), out)\n"
-            + ("time.sleep(30)\n" if wait else "")
-            + f"print({json.dumps(reply)!r})\n"
-        )
-        helper.chmod(0o755)
-        return helper
+    def chooser_daemon(self, reply=None):
+        """Serves com.cutefish.FileChooser like the file manager daemon; Open waits without @reply."""
+        self.daemon_calls = []
+        self.daemon_pending = []
+
+        def method_call(connection, sender, path, interface, method, parameters, invocation):
+            self.daemon_calls.append((method, parameters.unpack()))
+            if method == "Close":
+                invocation.return_value(None)
+            elif reply is None:
+                self.daemon_pending.append(invocation)
+            else:
+                invocation.return_value(GLib.Variant("(s)", (json.dumps(reply),)))
+
+        info = Gio.DBusNodeInfo.new_for_xml(CHOOSER_XML).interfaces[0]
+        registration = self.bus.register_object(CHOOSER_PATH, info, method_call, None, None)
+        self.addCleanup(self.bus.unregister_object, registration)
+        result = self.bus_call("RequestName", GLib.Variant("(su)", (CHOOSER_SERVICE, 4)))
+        self.assertEqual(result.unpack(), (1,))
+        self.addCleanup(self.bus_call, "ReleaseName", GLib.Variant("(s)", (CHOOSER_SERVICE,)))
+
+    def daemon_request(self):
+        [(method, (request_id, payload))] = self.daemon_calls
+        self.assertEqual(method, "Open")
+        return request_id, json.loads(payload)
 
     def file_request(self, method="OpenFile", options=None, handle=None):
         return self.call("org.freedesktop.impl.portal.FileChooser", method,
@@ -248,9 +265,9 @@ class SettingsPortalTest(unittest.TestCase):
                              "org.example.Editor", "", "Choose a file", options or {})))
 
     def test_file_chooser_filters_choices_and_encoded_uris(self):
-        helper = self.chooser_helper({"response": 0, "uris": ["file:///tmp/Hello%20world.txt"],
-                                      "filter_index": 0, "choices": {"encoding": "utf8"}})
-        self.start(helper=helper)
+        self.start()
+        self.chooser_daemon({"response": 0, "uris": ["file:///tmp/Hello%20world.txt"],
+                             "filter_index": 0, "choices": {"encoding": "utf8"}})
         selected_filter = ("Text", [(0, "*.txt"), (1, "text/plain")])
         reply = self.file_request(options={
             "filters": GLib.Variant("a(sa(us))", [selected_filter]),
@@ -266,54 +283,63 @@ class SettingsPortalTest(unittest.TestCase):
         self.assertEqual(results["uris"], ["file:///tmp/Hello%20world.txt"])
         self.assertEqual(results["current_filter"], selected_filter)
         self.assertEqual(results["choices"], [("encoding", "utf8")])
-        payload = json.loads(self.helper_input.read_text())
+        request_id, payload = self.daemon_request()
+        self.assertEqual(request_id, "/org/freedesktop/portal/desktop/request/test/chooser")
+        self.assertEqual(payload["mode"], "OpenFile")
         self.assertEqual(payload["current_folder"], "/tmp")
         self.assertEqual(payload["filters"][0]["rules"][1], {"type": 1, "value": "text/plain"})
         self.assertTrue(payload["multiple"])
         self.assertEqual(self.read(), 2)
 
     def test_save_files_passes_suggested_names(self):
-        self.start(helper=self.chooser_helper({"response": 0, "uris": [
-            "file:///tmp/one.txt", "file:///tmp/two.txt"]}))
+        self.start()
+        self.chooser_daemon({"response": 0, "uris": ["file:///tmp/one.txt", "file:///tmp/two.txt"]})
         response, results = self.file_request("SaveFiles", {
             "files": GLib.Variant("aay", [b"one.txt\0", b"two.txt\0"]),
         }).unpack()
         self.assertEqual(response, 0)
         self.assertEqual(len(results["uris"]), 2)
-        self.assertEqual(json.loads(self.helper_input.read_text())["files"], ["one.txt", "two.txt"])
+        self.assertEqual(self.daemon_request()[1]["files"], ["one.txt", "two.txt"])
 
     def test_file_chooser_rejects_nonlocal_result(self):
-        self.start(helper=self.chooser_helper({"response": 0, "uris": ["https://example.com/file"]}))
+        self.start()
+        self.chooser_daemon({"response": 0, "uris": ["https://example.com/file"]})
         self.assertEqual(self.file_request().unpack(), (2, {}))
 
-    def test_file_chooser_missing_helper(self):
-        self.start(helper=self.config / "missing-helper")
+    def test_file_chooser_without_file_manager(self):
+        self.start()
         self.assertEqual(self.file_request().unpack(), (2, {}))
         self.assertEqual(self.read(), 2)
 
     def test_file_chooser_cancellation_and_request_cleanup(self):
-        self.start(helper=self.chooser_helper({"response": 0}, wait=True))
+        self.start()
+        self.chooser_daemon()
         handle = "/org/freedesktop/portal/desktop/request/test/cancel"
         result = []
-
-        def done(connection, pending):
-            result.append(connection.call_finish(pending))
-
         self.bus.call(SERVICE, PATH, "org.freedesktop.impl.portal.FileChooser", "OpenFile",
                       GLib.Variant("(osssa{sv})", (handle, "org.example.App", "", "Open", {})),
-                      None, Gio.DBusCallFlags.NONE, 5000, None, done)
-        spin_until(lambda: self.helper_input.exists())
+                      None, Gio.DBusCallFlags.NONE, 5000, None,
+                      lambda connection, pending: result.append(connection.call_finish(pending)))
+        spin_until(lambda: bool(self.daemon_pending))
         self.assertEqual(self.read(), 2)
         self.call("org.freedesktop.impl.portal.Request", "Close", path=handle)
-        spin_until(lambda: bool(result))
+        spin_until(lambda: bool(result) and len(self.daemon_calls) == 2)
         self.assertEqual(result[0].unpack(), (1, {}))
+        self.assertEqual(self.daemon_calls[1], ("Close", (handle,)))
         with self.assertRaises(GLib.Error):
             self.call("org.freedesktop.impl.portal.Request", "Close", path=handle)
+        # The daemon's late cancellation reply finds the request gone.
+        self.daemon_pending[0].return_value(GLib.Variant("(s)", ('{"response":1}',)))
+        self.assertEqual(self.read(), 2)
 
-    @unittest.skipUnless(os.environ.get("CUTEFISH_TEST_CHOOSER_HELPER"),
-                         "Set CUTEFISH_TEST_CHOOSER_HELPER to test the real File Manager UI")
+    @unittest.skipUnless(os.environ.get("CUTEFISH_TEST_FILEMANAGER"),
+                         "Set CUTEFISH_TEST_FILEMANAGER to test the real File Manager UI")
     def test_real_file_manager_dialog_can_be_cancelled(self):
-        self.start(helper=os.environ["CUTEFISH_TEST_CHOOSER_HELPER"])
+        daemon = subprocess.Popen([os.environ["CUTEFISH_TEST_FILEMANAGER"], "--daemon"])
+        self.addCleanup(daemon.wait, 5)
+        self.addCleanup(daemon.terminate)
+        spin_until(lambda: self.owned(CHOOSER_SERVICE), timeout=10)
+        self.start()
         handle = "/org/freedesktop/portal/desktop/request/test/real_ui"
         result = []
         self.bus.call(SERVICE, PATH, "org.freedesktop.impl.portal.FileChooser", "SaveFile",
@@ -324,7 +350,7 @@ class SettingsPortalTest(unittest.TestCase):
                       lambda connection, pending: result.append(connection.call_finish(pending)))
         deadline = time.monotonic() + 0.6
         spin_until(lambda: time.monotonic() >= deadline)
-        self.assertFalse(result, "The real chooser exited before the user responded")
+        self.assertFalse(result, "The real chooser answered before the user responded")
         self.call("org.freedesktop.impl.portal.Request", "Close", path=handle)
         spin_until(lambda: bool(result))
         self.assertEqual(result[0].unpack(), (1, {}))
@@ -352,7 +378,8 @@ class SettingsPortalTest(unittest.TestCase):
     def test_frontend_file_chooser_response(self):
         selected = self.config / "selected.txt"
         selected.write_text("example")
-        self.start(helper=self.chooser_helper({"response": 0, "uris": [selected.as_uri()]}))
+        self.start()
+        self.chooser_daemon({"response": 0, "uris": [selected.as_uri()]})
         service = self.start_frontend()
         events = []
         self.subscriptions.append(self.bus.signal_subscribe(

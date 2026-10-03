@@ -11,7 +11,7 @@ sudo apt install cmake ninja-build pkg-config qt6-base-dev libpipewire-0.3-dev \
 ```
 
 At runtime it needs `xdg-desktop-portal`, `xdg-desktop-portal-gtk`, PipeWire,
-cutefish-services and File Manager's `cutefish-filechooser`. Tests also need
+cutefish-services and the File Manager daemon (file dialogs). Tests also need
 `dbus-run-session` and `python3-gi`.
 
 ## Build
