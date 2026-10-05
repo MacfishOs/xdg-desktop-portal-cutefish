@@ -6,14 +6,12 @@
 #include <QDBusPendingReply>
 #include <QDBusReply>
 
-namespace {
-void error(const QDBusConnection &bus, const QDBusMessage &message, const QString &name,
-           const QString &description)
+static void error(const QDBusConnection &bus, const QDBusMessage &message, const QString &name,
+                  const QString &description)
 {
     message.setDelayedReply(true);
     bus.send(message.createErrorReply(name, description));
 }
-} // namespace
 
 class InhibitRequest : public QObject
 {

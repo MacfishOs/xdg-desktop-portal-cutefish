@@ -84,9 +84,7 @@ struct ScreenCastStreamEvents {
     }
 };
 
-namespace {
-
-const pw_stream_events streamEvents = [] {
+static const pw_stream_events streamEvents = [] {
     pw_stream_events events {};
     events.version = PW_VERSION_STREAM_EVENTS;
     events.state_changed = ScreenCastStreamEvents::stateChanged;
@@ -97,12 +95,12 @@ const pw_stream_events streamEvents = [] {
     return events;
 }();
 
-constexpr int bytesPerPixel = 4;
-constexpr int damageRegions = 16;
-constexpr int dmabufFailureLimit = 3;
+static constexpr int bytesPerPixel = 4;
+static constexpr int damageRegions = 16;
+static constexpr int dmabufFailureLimit = 3;
 
 // ARGB8888 little-endian memory order is what SPA calls BGRA.
-spa_video_format spaFormat(uint32_t drmFormat)
+static spa_video_format spaFormat(uint32_t drmFormat)
 {
     switch (drmFormat) {
     case DRM_FORMAT_ARGB8888:
@@ -114,7 +112,7 @@ spa_video_format spaFormat(uint32_t drmFormat)
     }
 }
 
-uint32_t drmFormat(spa_video_format format)
+static uint32_t drmFormat(spa_video_format format)
 {
     switch (format) {
     case SPA_VIDEO_FORMAT_BGRA:
@@ -127,7 +125,7 @@ uint32_t drmFormat(spa_video_format format)
 }
 
 // The DRM node with this st_rdev, which is what the compositor names.
-QString drmNodeFor(dev_t device)
+static QString drmNodeFor(dev_t device)
 {
     QDirIterator nodes(QStringLiteral("/dev/dri"), QDir::System | QDir::Files);
     while (nodes.hasNext()) {
@@ -143,7 +141,7 @@ QString drmNodeFor(dev_t device)
 // refuse gbm_bo_create_with_modifiers even for LINEAR, while the flag form
 // allocates a linear buffer fine; both forms are tried so the buffer path
 // accepts whatever the modifier probe accepted.
-gbm_bo *allocateDmaBuf(gbm_device *gbm, const QSize &size, uint32_t format, uint64_t modifier)
+static gbm_bo *allocateDmaBuf(gbm_device *gbm, const QSize &size, uint32_t format, uint64_t modifier)
 {
     const auto width = uint32_t(size.width());
     const auto height = uint32_t(size.height());
@@ -164,8 +162,6 @@ gbm_bo *allocateDmaBuf(gbm_device *gbm, const QSize &size, uint32_t format, uint
     }
     return bo;
 }
-
-} // namespace
 
 ScreenCastStream::ScreenCastStream(WaylandCapture *wayland, PipeWireCore *pipewire,
                                    const CaptureTarget &target, bool cursor, int maxFramerate,

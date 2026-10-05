@@ -14,11 +14,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+static int g_signalFds[2] = {-1, -1};
 
-int g_signalFds[2] = {-1, -1};
-
-void onSignal(int)
+static void onSignal(int)
 {
     const char byte = 0;
     (void)!write(g_signalFds[0], &byte, 1);
@@ -26,7 +24,7 @@ void onSignal(int)
 
 // A termination signal ends the event loop instead of the process, so the
 // portals and the leak checker of a sanitizer build get their shutdown.
-void quitOnSignal(QCoreApplication *app)
+static void quitOnSignal(QCoreApplication *app)
 {
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, g_signalFds) != 0)
         return;
@@ -43,8 +41,6 @@ void quitOnSignal(QCoreApplication *app)
     sigaction(SIGTERM, &action, nullptr);
     sigaction(SIGINT, &action, nullptr);
 }
-
-} // namespace
 
 int main(int argc, char *argv[])
 {

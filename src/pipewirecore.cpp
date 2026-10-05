@@ -5,9 +5,7 @@
 
 #include <pipewire/pipewire.h>
 
-namespace {
-
-const pw_core_events coreEvents = [] {
+static const pw_core_events coreEvents = [] {
     pw_core_events events {};
     events.version = PW_VERSION_CORE_EVENTS;
     events.error = [](void *data, uint32_t id, int, int result, const char *message) {
@@ -20,8 +18,6 @@ const pw_core_events coreEvents = [] {
     };
     return events;
 }();
-
-} // namespace
 
 PipeWireCore::PipeWireCore(QObject *parent)
     : QObject(parent)

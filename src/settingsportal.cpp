@@ -10,20 +10,18 @@
 
 #include <algorithm>
 
-namespace {
-const QString AppearanceService = QStringLiteral("com.cutefish.Services");
-const QString AppearancePath = QStringLiteral("/com/cutefish/Services/Appearance");
-const QString AppearanceInterface = QStringLiteral("com.cutefish.Services.Appearance");
-const QString AppearanceNamespace = QStringLiteral("org.freedesktop.appearance");
-const QString ColorSchemeKey = QStringLiteral("color-scheme");
+static const QString AppearanceService = QStringLiteral("com.cutefish.Services");
+static const QString AppearancePath = QStringLiteral("/com/cutefish/Services/Appearance");
+static const QString AppearanceInterface = QStringLiteral("com.cutefish.Services.Appearance");
+static const QString AppearanceNamespace = QStringLiteral("org.freedesktop.appearance");
+static const QString ColorSchemeKey = QStringLiteral("color-scheme");
 
-bool matchesNamespace(const QString &pattern)
+static bool matchesNamespace(const QString &pattern)
 {
     return pattern.isEmpty() || pattern == QStringLiteral("*") || pattern == AppearanceNamespace
             || (pattern.endsWith(QStringLiteral(".*"))
                 && AppearanceNamespace.startsWith(pattern.chopped(1)));
 }
-} // namespace
 
 SettingsPortal::SettingsPortal(const QDBusConnection &bus, QObject *parent)
     : QObject(parent)

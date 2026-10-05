@@ -13,22 +13,20 @@
 #include <climits>
 #include <cmath>
 
-namespace {
+static constexpr uint sourceMonitor = 1;
+static constexpr uint sourceWindow = 2;
+static constexpr uint cursorHidden = 1;
+static constexpr uint cursorEmbedded = 2;
+static constexpr uint persistNone = 0;
+static constexpr uint persistUntilRevoked = 2;
 
-constexpr uint sourceMonitor = 1;
-constexpr uint sourceWindow = 2;
-constexpr uint cursorHidden = 1;
-constexpr uint cursorEmbedded = 2;
-constexpr uint persistNone = 0;
-constexpr uint persistUntilRevoked = 2;
-
-QStringList stringList(const QVariant &value)
+static QStringList stringList(const QVariant &value)
 {
     return value.canConvert<QDBusArgument>() ? qdbus_cast<QStringList>(value)
                                              : value.toStringList();
 }
 
-QStringList restoredMonitors(const QVariant &value)
+static QStringList restoredMonitors(const QVariant &value)
 {
     if (!value.canConvert<QDBusArgument>())
         return {};
@@ -41,7 +39,7 @@ QStringList restoredMonitors(const QVariant &value)
     return stringList(map.value(QStringLiteral("monitors")));
 }
 
-QVariant restoreData(const QStringList &monitors)
+static QVariant restoreData(const QStringList &monitors)
 {
     RestoreData data;
     data.vendor = QStringLiteral("Cutefish");
@@ -50,12 +48,12 @@ QVariant restoreData(const QStringList &monitors)
     return QVariant::fromValue(data);
 }
 
-int framerateFor(const CaptureOutput &output)
+static int framerateFor(const CaptureOutput &output)
 {
     return output.refreshMilliHz > 0 ? int(std::ceil(output.refreshMilliHz / 1000.0)) : 60;
 }
 
-const CaptureOutput *findOutput(const QList<CaptureOutput> &outputs, const QString &name)
+static const CaptureOutput *findOutput(const QList<CaptureOutput> &outputs, const QString &name)
 {
     const auto it = std::find_if(outputs.begin(), outputs.end(), [&](const CaptureOutput &output) {
         return output.name == name;
@@ -63,15 +61,13 @@ const CaptureOutput *findOutput(const QList<CaptureOutput> &outputs, const QStri
     return it != outputs.end() ? &*it : nullptr;
 }
 
-QDBusMessage permissionsCall(const QString &method)
+static QDBusMessage permissionsCall(const QString &method)
 {
     return QDBusMessage::createMethodCall(QStringLiteral("com.cutefish.Services"),
                                           QStringLiteral("/com/cutefish/Services/Permissions"),
                                           QStringLiteral("com.cutefish.Services.Permissions"),
                                           method);
 }
-
-} // namespace
 
 class StartRequest;
 

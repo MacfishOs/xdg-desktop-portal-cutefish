@@ -13,11 +13,10 @@
 
 #include <limits>
 
-namespace {
-const QString chooserService = QStringLiteral("com.cutefish.FileChooser");
-const QString chooserPath = QStringLiteral("/com/cutefish/FileChooser");
+static const QString chooserService = QStringLiteral("com.cutefish.FileChooser");
+static const QString chooserPath = QStringLiteral("/com/cutefish/FileChooser");
 
-QJsonObject filterJson(const FileFilter &filter)
+static QJsonObject filterJson(const FileFilter &filter)
 {
     QJsonArray rules;
     for (const auto &rule : filter.rules)
@@ -25,14 +24,13 @@ QJsonObject filterJson(const FileFilter &filter)
     return {{"name", filter.name}, {"rules", rules}};
 }
 
-QString localPath(const QVariant &value)
+static QString localPath(const QVariant &value)
 {
     QByteArray bytes = qdbus_cast<QByteArray>(value);
     if (bytes.endsWith('\0'))
         bytes.chop(1);
     return QFile::decodeName(bytes);
 }
-} // namespace
 
 class FileChooserRequest : public QObject
 {

@@ -31,9 +31,7 @@ struct WaylandCapture::Output {
     bool done = false;
 };
 
-namespace {
-
-const wl_output_listener outputListener = {
+static const wl_output_listener outputListener = {
         [](void *data, wl_output *, int32_t x, int32_t y, int32_t, int32_t, int32_t, const char *,
            const char *, int32_t) {
             auto *output = static_cast<WaylandCapture::Output *>(data);
@@ -63,7 +61,7 @@ const wl_output_listener outputListener = {
                     QString::fromUtf8(description);
         }};
 
-const zxdg_output_v1_listener xdgOutputListener = {
+static const zxdg_output_v1_listener xdgOutputListener = {
         [](void *data, zxdg_output_v1 *, int32_t x, int32_t y) {
             static_cast<WaylandCapture::Output *>(data)->pending.logicalPosition = QPoint(x, y);
         },
@@ -77,15 +75,13 @@ const zxdg_output_v1_listener xdgOutputListener = {
         [](void *, zxdg_output_v1 *, const char *) {}};
 
 // wl_output_destroy sends nothing, which leaves the binding in the compositor.
-void releaseOutput(wl_output *output)
+static void releaseOutput(wl_output *output)
 {
     if (wl_output_get_version(output) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
         wl_output_release(output);
     else
         wl_output_destroy(output);
 }
-
-} // namespace
 
 struct WaylandCaptureEvents {
     static void global(void *data, wl_registry *, uint32_t name, const char *interface,
@@ -228,29 +224,25 @@ struct CaptureSessionEvents {
     }
 };
 
-namespace {
+static const wl_registry_listener registryListener = {WaylandCaptureEvents::global,
+                                                      WaylandCaptureEvents::globalRemove};
 
-const wl_registry_listener registryListener = {WaylandCaptureEvents::global,
-                                               WaylandCaptureEvents::globalRemove};
-
-const ext_foreign_toplevel_list_v1_listener toplevelListListener = {
+static const ext_foreign_toplevel_list_v1_listener toplevelListListener = {
         WaylandCaptureEvents::toplevel, WaylandCaptureEvents::finished};
 
-const ext_foreign_toplevel_handle_v1_listener toplevelListener = {
+static const ext_foreign_toplevel_handle_v1_listener toplevelListener = {
         WaylandCaptureEvents::closed, WaylandCaptureEvents::done, WaylandCaptureEvents::title,
         WaylandCaptureEvents::appId, WaylandCaptureEvents::identifier};
 
-const ext_image_copy_capture_session_v1_listener sessionListener = {
+static const ext_image_copy_capture_session_v1_listener sessionListener = {
         CaptureSessionEvents::bufferSize,   CaptureSessionEvents::shmFormat,
         CaptureSessionEvents::dmabufDevice, CaptureSessionEvents::dmabufFormat,
         CaptureSessionEvents::done,         CaptureSessionEvents::stopped};
 
-const ext_image_copy_capture_frame_v1_listener frameListener = {
+static const ext_image_copy_capture_frame_v1_listener frameListener = {
         CaptureSessionEvents::transform, CaptureSessionEvents::damage,
         CaptureSessionEvents::presentationTime, CaptureSessionEvents::ready,
         CaptureSessionEvents::failed};
-
-} // namespace
 
 WaylandCapture::WaylandCapture(QObject *parent)
     : QObject(parent)
@@ -439,9 +431,11 @@ struct PendingDmaBuf {
     std::vector<zwp_linux_buffer_params_v1 *> *pendingParams;
 };
 
+} // namespace
+
 // Takes the import out of the pending list and frees its proxy and record,
 // handing back the callback to run.
-std::function<void(wl_buffer *)> finishPending(void *data, zwp_linux_buffer_params_v1 *params)
+static std::function<void(wl_buffer *)> finishPending(void *data, zwp_linux_buffer_params_v1 *params)
 {
     auto *pending = static_cast<PendingDmaBuf *>(data);
     auto &list = *pending->pendingParams;
@@ -452,15 +446,13 @@ std::function<void(wl_buffer *)> finishPending(void *data, zwp_linux_buffer_para
     return done;
 }
 
-const zwp_linux_buffer_params_v1_listener paramsListener = {
+static const zwp_linux_buffer_params_v1_listener paramsListener = {
         [](void *data, zwp_linux_buffer_params_v1 *params, wl_buffer *buffer) {
             finishPending(data, params)(buffer);
         },
         [](void *data, zwp_linux_buffer_params_v1 *params) {
             finishPending(data, params)(nullptr);
         }};
-
-} // namespace
 
 bool WaylandCapture::createDmaBufBuffer(const QSize &size, uint32_t format, uint64_t modifier,
                                         const std::vector<DmaBufPlane> &planes,
