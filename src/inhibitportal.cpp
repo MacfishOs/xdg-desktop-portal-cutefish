@@ -130,7 +130,8 @@ void InhibitPortal::Inhibit(const QDBusObjectPath &handle, const QString &appId,
                             const QDBusMessage &message)
 {
     Q_UNUSED(window)
-    if (flags != 8) {
+    // Only the idle bit is honoured; the others ride along, e.g. suspend|idle from players.
+    if (!(flags & 8)) {
         error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.NotSupported"),
               QStringLiteral("Only idle inhibition (flag 8) is supported"));
         return;

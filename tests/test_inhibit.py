@@ -85,10 +85,13 @@ class InhibitPortalTest(unittest.TestCase):
         spin_until(lambda: not self.cookies)
 
     def test_flags_and_source_failure(self):
-        for flags in (0, 1, 2, 4, 12, 16):
+        for flags in (0, 1, 2, 4, 16):
             with self.assertRaises(GLib.Error):
                 self.inhibit("flags", flags)
         self.assertFalse(self.cookies)
+        self.inhibit("both", 12)
+        self.close("both")
+        spin_until(lambda: not self.cookies)
         self.fail = True
         with self.assertRaises(GLib.Error):
             self.inhibit("failure")
