@@ -1,10 +1,8 @@
 #include "inhibitportal.h"
 #include "requesterwatch.h"
 
-#include <QDBusConnectionInterface>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
-#include <QDBusReply>
 
 static void error(const QDBusConnection &bus, const QDBusMessage &message, const QString &name,
                   const QString &description)
@@ -141,21 +139,34 @@ void InhibitPortal::Inhibit(const QDBusObjectPath &handle, const QString &appId,
               QStringLiteral("Invalid request path"));
         return;
     }
-    const QDBusReply<QString> owner =
-            m_bus.interface()->serviceOwner(QStringLiteral("org.freedesktop.ScreenSaver"));
-    if (!owner.isValid()) {
-        error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.Failed"),
-              QStringLiteral("ScreenSaver inhibition service is unavailable"));
-        return;
-    }
-    auto *request = new InhibitRequest(this, m_bus, message, handle.path(), owner.value());
-    if (!m_bus.registerObject(handle.path(), request, QDBusConnection::ExportAllSlots)) {
-        delete request;
-        error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.Failed"),
-              QStringLiteral("Cannot export inhibition request"));
-        return;
-    }
-    request->start(appId, options.value(QStringLiteral("reason")).toString());
+    // Asked without blocking, so a busy bus never stalls the other portals; the
+    // reply waits for the answer.
+    message.setDelayedReply(true);
+    QDBusMessage ownerCall = QDBusMessage::createMethodCall(
+            QStringLiteral("org.freedesktop.DBus"), QStringLiteral("/org/freedesktop/DBus"),
+            QStringLiteral("org.freedesktop.DBus"), QStringLiteral("GetNameOwner"));
+    ownerCall << QStringLiteral("org.freedesktop.ScreenSaver");
+    auto *watcher = new QDBusPendingCallWatcher(m_bus.asyncCall(ownerCall), this);
+    const QString path = handle.path();
+    const QString reason = options.value(QStringLiteral("reason")).toString();
+    connect(watcher, &QDBusPendingCallWatcher::finished, this,
+            [this, message, path, appId, reason](QDBusPendingCallWatcher *call) {
+                call->deleteLater();
+                const QDBusPendingReply<QString> owner = *call;
+                if (owner.isError()) {
+                    error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.Failed"),
+                          QStringLiteral("ScreenSaver inhibition service is unavailable"));
+                    return;
+                }
+                auto *request = new InhibitRequest(this, m_bus, message, path, owner.value());
+                if (!m_bus.registerObject(path, request, QDBusConnection::ExportAllSlots)) {
+                    delete request;
+                    error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.Failed"),
+                          QStringLiteral("Cannot export inhibition request"));
+                    return;
+                }
+                request->start(appId, reason);
+            });
 }
 
 #include "inhibitportal.moc"

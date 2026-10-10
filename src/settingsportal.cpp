@@ -1,8 +1,9 @@
 #include "settingsportal.h"
 
 #include <QDBusMessage>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
 #include <QDBusMetaType>
-#include <QDBusReply>
 #include <QDBusServiceWatcher>
 #include <QDebug>
 #include <QSettings>
@@ -90,7 +91,11 @@ void SettingsPortal::refreshAppearance()
     message.setAutoStartService(false);
 
     // The live property can be newer than the QSettings file when a change is pending on disk.
-    const QDBusReply<QDBusVariant> reply = m_bus.call(message, QDBus::Block, 1000);
-    if (reply.isValid() && reply.value().variant().metaType().id() == QMetaType::Bool)
-        setDarkMode(reply.value().variant().toBool());
+    auto *watcher = new QDBusPendingCallWatcher(m_bus.asyncCall(message, 1000), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *call) {
+        call->deleteLater();
+        const QDBusPendingReply<QDBusVariant> reply = *call;
+        if (reply.isValid() && reply.value().variant().metaType().id() == QMetaType::Bool)
+            setDarkMode(reply.value().variant().toBool());
+    });
 }
