@@ -1,5 +1,6 @@
 #include "filechooserportal.h"
 #include "inhibitportal.h"
+#include "requestrouter.h"
 #include "screencastportal.h"
 #include "settingsportal.h"
 
@@ -73,6 +74,11 @@ int main(int argc, char *argv[])
                                     | QDBusConnection::ExportAllProperties
                                     | QDBusConnection::ExportAdaptors)) {
         qCritical() << "Cannot export the Settings portal:" << bus.lastError();
+        return 1;
+    }
+
+    if (!RequestRouter::install(bus)) {
+        qCritical() << "Cannot export the portal requests:" << bus.lastError();
         return 1;
     }
 

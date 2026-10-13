@@ -1,6 +1,7 @@
 #include "screencastportal.h"
 #include "pipewirecore.h"
 #include "requesterwatch.h"
+#include "requestrouter.h"
 #include "screencaststream.h"
 #include "screencasttypes.h"
 #include "waylandcapture.h"
@@ -221,7 +222,7 @@ public:
         if (finished)
             return;
         finished = true;
-        bus.unregisterObject(path);
+        RequestRouter::remove(path);
         bus.send(message.createReply({response, results}));
         if (prompting) {
             auto call = permissionsCall(QStringLiteral("Dismiss"));
@@ -487,7 +488,7 @@ uint ScreenCastPortal::Start(const QDBusObjectPath &handle, const QDBusObjectPat
         || !handle.path().startsWith(QStringLiteral("/org/freedesktop/portal/desktop/request/")))
         return 2;
     auto *request = new StartRequest(m_bus, message, handle.path(), session, m_wayland, m_pipewire);
-    if (!m_bus.registerObject(handle.path(), request, QDBusConnection::ExportAllSlots)) {
+    if (!RequestRouter::add(handle.path(), request)) {
         delete request;
         return 2;
     }

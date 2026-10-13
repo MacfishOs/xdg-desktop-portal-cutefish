@@ -1,6 +1,7 @@
 #include "filechooserportal.h"
 #include "filechoosertypes.h"
 #include "requesterwatch.h"
+#include "requestrouter.h"
 
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
@@ -87,7 +88,7 @@ public:
             close.setAutoStartService(false);
             bus.send(close);
         }
-        bus.unregisterObject(path);
+        RequestRouter::remove(path);
         bus.send(message.createReply({response, results}));
         deleteLater();
     }
@@ -214,7 +215,7 @@ uint FileChooserPortal::choose(const QString &mode, const QDBusObjectPath &handl
                                const QDBusMessage &message)
 {
     auto *request = new FileChooserRequest(m_bus, message, handle.path(), this);
-    if (!m_bus.registerObject(handle.path(), request, QDBusConnection::ExportAllSlots)) {
+    if (!RequestRouter::add(handle.path(), request)) {
         delete request;
         return 2;
     }

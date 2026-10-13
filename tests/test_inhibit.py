@@ -135,6 +135,29 @@ class InhibitPortalTest(unittest.TestCase):
         invocation.return_value(GLib.Variant("(u)", (cookie,)))
         spin_until(lambda: not self.cookies)
 
+    def test_close_right_after_inhibit(self):
+        replies = {}
+
+        def finished(name):
+            def done(connection, pending):
+                try:
+                    replies[name] = connection.call_finish(pending)
+                except GLib.Error as error:
+                    replies[name] = error
+            return done
+
+        # Sent back to back, as the frontend does when the app closes at once.
+        self.bus.call(SERVICE, "/org/freedesktop/portal/desktop", INTERFACE, "Inhibit",
+                      self.parameters("early"), None, Gio.DBusCallFlags.NONE, 3000, None,
+                      finished("inhibit"))
+        self.bus.call(SERVICE, REQUEST + "early", "org.freedesktop.impl.portal.Request", "Close",
+                      None, None, Gio.DBusCallFlags.NONE, 3000, None, finished("close"))
+        spin_until(lambda: len(replies) == 2)
+        # assert* would reach the fail attribute these tests shadow.
+        if isinstance(replies["close"], GLib.Error):
+            raise AssertionError(replies["close"].message)
+        spin_until(lambda: not self.cookies)
+
     @unittest.skipUnless(Path("/usr/libexec/xdg-desktop-portal").exists(),
                          "xdg-desktop-portal frontend is not installed")
     def test_public_frontend_inhibit_and_close(self):
