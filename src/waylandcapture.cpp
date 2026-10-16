@@ -1,11 +1,14 @@
 #include "waylandcapture.h"
+#include "requestobject.h"
 
-#include <QDebug>
-#include <QSocketNotifier>
+#include "base/event_loop.h"
+#include "base/logging.h"
+#include "base/strings.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <sys/epoll.h>
 #include <utility>
 #include <ext-foreign-toplevel-list-v1-client-protocol.h>
 #include <ext-image-capture-source-v1-client-protocol.h>
@@ -13,6 +16,8 @@
 #include <linux-dmabuf-v1-client-protocol.h>
 #include <wayland-client.h>
 #include <xdg-output-unstable-v1-client-protocol.h>
+
+using namespace cutefish;
 
 struct WaylandCapture::Toplevel {
     ext_foreign_toplevel_handle_v1 *handle = nullptr;
@@ -36,7 +41,7 @@ static const wl_output_listener outputListener = {
            const char *, int32_t) {
             auto *output = static_cast<WaylandCapture::Output *>(data);
             if (!output->xdgOutput)
-                output->pending.logicalPosition = QPoint(x, y);
+                output->pending.logicalPosition = base::Point(x, y);
         },
         [](void *data, wl_output *, uint32_t flags, int32_t width, int32_t height,
            int32_t refresh) {
@@ -45,7 +50,7 @@ static const wl_output_listener outputListener = {
                 return;
             output->pending.refreshMilliHz = refresh;
             if (!output->xdgOutput)
-                output->pending.logicalSize = QSize(width, height);
+                output->pending.logicalSize = base::Size(width, height);
         },
         [](void *data, wl_output *) {
             auto *output = static_cast<WaylandCapture::Output *>(data);
@@ -54,20 +59,19 @@ static const wl_output_listener outputListener = {
         },
         [](void *, wl_output *, int32_t) {},
         [](void *data, wl_output *, const char *name) {
-            static_cast<WaylandCapture::Output *>(data)->pending.name = QString::fromUtf8(name);
+            static_cast<WaylandCapture::Output *>(data)->pending.name = base::strings::sanitizedUtf8(name);
         },
         [](void *data, wl_output *, const char *description) {
             static_cast<WaylandCapture::Output *>(data)->pending.description =
-                    QString::fromUtf8(description);
+                    base::strings::sanitizedUtf8(description);
         }};
 
 static const zxdg_output_v1_listener xdgOutputListener = {
         [](void *data, zxdg_output_v1 *, int32_t x, int32_t y) {
-            static_cast<WaylandCapture::Output *>(data)->pending.logicalPosition = QPoint(x, y);
+            static_cast<WaylandCapture::Output *>(data)->pending.logicalPosition = base::Point(x, y);
         },
         [](void *data, zxdg_output_v1 *, int32_t width, int32_t height) {
-            static_cast<WaylandCapture::Output *>(data)->pending.logicalSize =
-                    QSize(width, height);
+            static_cast<WaylandCapture::Output *>(data)->pending.logicalSize = base::Size(width, height);
         },
         // Version 3 folds this into wl_output.done.
         [](void *, zxdg_output_v1 *) {},
@@ -118,18 +122,18 @@ struct WaylandCaptureEvents {
 
     static void title(void *data, ext_foreign_toplevel_handle_v1 *, const char *title)
     {
-        static_cast<WaylandCapture::Toplevel *>(data)->pending.title = QString::fromUtf8(title);
+        static_cast<WaylandCapture::Toplevel *>(data)->pending.title = base::strings::sanitizedUtf8(title);
     }
 
     static void appId(void *data, ext_foreign_toplevel_handle_v1 *, const char *appId)
     {
-        static_cast<WaylandCapture::Toplevel *>(data)->pending.appId = QString::fromUtf8(appId);
+        static_cast<WaylandCapture::Toplevel *>(data)->pending.appId = base::strings::sanitizedUtf8(appId);
     }
 
     static void identifier(void *data, ext_foreign_toplevel_handle_v1 *, const char *identifier)
     {
         static_cast<WaylandCapture::Toplevel *>(data)->pending.identifier =
-                QString::fromUtf8(identifier);
+                base::strings::sanitizedUtf8(identifier);
     }
 };
 
@@ -139,8 +143,8 @@ struct CaptureSessionEvents {
     {
         auto *session = static_cast<CaptureSession *>(data);
         session->m_pendingSize = width > 0 && height > 0 && width <= 16384 && height <= 16384
-                ? QSize(int(width), int(height))
-                : QSize();
+                ? base::Size(int(width), int(height))
+                : base::Size();
         session->m_pendingArgb = false;
     }
 
@@ -175,7 +179,8 @@ struct CaptureSessionEvents {
         session->m_argb = session->m_pendingArgb;
         session->m_dmabufDevice = session->m_pendingDmabufDevice;
         session->m_dmabufFormats = session->m_pendingDmabufFormats;
-        Q_EMIT session->constraintsChanged();
+        if (auto callback = session->onConstraintsChanged)
+            callback();
     }
 
     static void stopped(void *data, ext_image_copy_capture_session_v1 *)
@@ -184,7 +189,8 @@ struct CaptureSessionEvents {
         if (session->m_stopped)
             return;
         session->m_stopped = true;
-        Q_EMIT session->stopped();
+        if (auto callback = session->onStopped)
+            callback();
     }
 
     static void transform(void *data, ext_image_copy_capture_frame_v1 *, uint32_t transform)
@@ -195,7 +201,7 @@ struct CaptureSessionEvents {
     static void damage(void *data, ext_image_copy_capture_frame_v1 *, int32_t x, int32_t y,
                        int32_t width, int32_t height)
     {
-        static_cast<CaptureSession *>(data)->m_damage.append(QRect(x, y, width, height));
+        static_cast<CaptureSession *>(data)->m_damage.emplace_back(x, y, width, height);
     }
 
     static void presentationTime(void *data, ext_image_copy_capture_frame_v1 *, uint32_t hi,
@@ -210,8 +216,9 @@ struct CaptureSessionEvents {
         auto *session = static_cast<CaptureSession *>(data);
         ext_image_copy_capture_frame_v1_destroy(session->m_frame);
         session->m_frame = nullptr;
-        const QList<QRect> damage = std::exchange(session->m_damage, {});
-        Q_EMIT session->frameReady(session->m_presentationNs, session->m_transform, damage);
+        const std::vector<base::Rect> damage = std::exchange(session->m_damage, {});
+        if (auto callback = session->onFrameReady)
+            callback(session->m_presentationNs, session->m_transform, damage);
     }
 
     static void failed(void *data, ext_image_copy_capture_frame_v1 *, uint32_t reason)
@@ -220,7 +227,8 @@ struct CaptureSessionEvents {
         ext_image_copy_capture_frame_v1_destroy(session->m_frame);
         session->m_frame = nullptr;
         session->m_damage.clear();
-        Q_EMIT session->frameFailed(reason);
+        if (auto callback = session->onFrameFailed)
+            callback(reason);
     }
 };
 
@@ -244,8 +252,8 @@ static const ext_image_copy_capture_frame_v1_listener frameListener = {
         CaptureSessionEvents::presentationTime, CaptureSessionEvents::ready,
         CaptureSessionEvents::failed};
 
-WaylandCapture::WaylandCapture(QObject *parent)
-    : QObject(parent)
+WaylandCapture::WaylandCapture()
+    : m_eventLoop(base::EventLoop::current())
 {
 }
 
@@ -260,7 +268,8 @@ bool WaylandCapture::connectToDisplay()
         return true;
     m_display = wl_display_connect(nullptr);
     if (!m_display) {
-        qWarning() << "Cannot connect to the Wayland display for screen capture";
+        CF_WARNING(base::LogCategory::defaultCategory())
+                << "Cannot connect to the Wayland display for screen capture";
         return false;
     }
     m_registry = wl_display_get_registry(m_display);
@@ -270,8 +279,7 @@ bool WaylandCapture::connectToDisplay()
         disconnect();
         return false;
     }
-    m_notifier = new QSocketNotifier(wl_display_get_fd(m_display), QSocketNotifier::Read, this);
-    connect(m_notifier, &QSocketNotifier::activated, this, &WaylandCapture::dispatch);
+    m_watch = m_eventLoop->watch(wl_display_get_fd(m_display), EPOLLIN, [this](uint32_t) { dispatch(); });
     return true;
 }
 
@@ -337,12 +345,12 @@ void WaylandCapture::addToplevel(ext_foreign_toplevel_handle_v1 *handle)
     m_toplevels.push_back(std::move(toplevel));
 }
 
-QList<CaptureToplevel> WaylandCapture::toplevels() const
+std::vector<CaptureToplevel> WaylandCapture::toplevels() const
 {
-    QList<CaptureToplevel> result;
+    std::vector<CaptureToplevel> result;
     for (const auto &toplevel : m_toplevels) {
-        if (toplevel->done && !toplevel->closed && !toplevel->current.identifier.isEmpty())
-            result.append(toplevel->current);
+        if (toplevel->done && !toplevel->closed && !toplevel->current.identifier.empty())
+            result.push_back(toplevel->current);
     }
     return result;
 }
@@ -372,17 +380,17 @@ void WaylandCapture::bindXdgOutputs()
     }
 }
 
-QList<CaptureOutput> WaylandCapture::outputs() const
+std::vector<CaptureOutput> WaylandCapture::outputs() const
 {
-    QList<CaptureOutput> result;
+    std::vector<CaptureOutput> result;
     for (const auto &output : m_outputs) {
-        if (output->done && !output->current.name.isEmpty())
-            result.append(output->current);
+        if (output->done && !output->current.name.empty())
+            result.push_back(output->current);
     }
     return result;
 }
 
-std::unique_ptr<CaptureSession> WaylandCapture::createSession(const QString &name, bool cursor)
+std::unique_ptr<CaptureSession> WaylandCapture::createSession(const std::string &name, bool cursor)
 {
     if (!captureAvailable())
         return nullptr;
@@ -396,7 +404,7 @@ std::unique_ptr<CaptureSession> WaylandCapture::createSession(const QString &nam
             cursor);
 }
 
-std::unique_ptr<CaptureSession> WaylandCapture::createToplevelSession(const QString &identifier,
+std::unique_ptr<CaptureSession> WaylandCapture::createToplevelSession(const std::string &identifier,
                                                                       bool cursor)
 {
     if (!captureAvailable() || !m_toplevelSources)
@@ -454,7 +462,7 @@ static const zwp_linux_buffer_params_v1_listener paramsListener = {
             finishPending(data, params)(nullptr);
         }};
 
-bool WaylandCapture::createDmaBufBuffer(const QSize &size, uint32_t format, uint64_t modifier,
+bool WaylandCapture::createDmaBufBuffer(const base::Size &size, uint32_t format, uint64_t modifier,
                                         const std::vector<DmaBufPlane> &planes,
                                         std::function<void(wl_buffer *)> done)
 {
@@ -474,7 +482,7 @@ bool WaylandCapture::createDmaBufBuffer(const QSize &size, uint32_t format, uint
     return true;
 }
 
-wl_buffer *WaylandCapture::createShmBuffer(int fd, const QSize &size, int stride)
+wl_buffer *WaylandCapture::createShmBuffer(int fd, const base::Size &size, int stride)
 {
     if (!m_shm)
         return nullptr;
@@ -496,7 +504,7 @@ void WaylandCapture::scheduleDisconnect()
     if (m_disconnectPending || !m_display)
         return;
     m_disconnectPending = true;
-    QMetaObject::invokeMethod(this, &WaylandCapture::disconnect, Qt::QueuedConnection);
+    later(m_alive, [this] { disconnect(); });
 }
 
 void WaylandCapture::dispatch()
@@ -528,7 +536,7 @@ void WaylandCapture::disconnect()
     m_disconnectPending = false;
     if (!m_display)
         return;
-    qWarning() << "Lost the Wayland display used for screen capture";
+    CF_WARNING(base::LogCategory::defaultCategory()) << "Lost the Wayland display used for screen capture";
     // An import the compositor will never answer fails now, while its
     // session is still whole.
     const auto pending = std::exchange(m_pendingParams, {});
@@ -538,9 +546,11 @@ void WaylandCapture::disconnect()
         finishPending(record, params)(nullptr);
     }
     // Sessions release their proxies while the display still exists.
-    Q_EMIT disconnected();
-    delete m_notifier;
-    m_notifier = nullptr;
+    disconnected.emit();
+    if (m_watch) {
+        m_eventLoop->unwatch(m_watch);
+        m_watch = 0;
+    }
     for (auto &output : m_outputs) {
         if (output->xdgOutput)
             zxdg_output_v1_destroy(output->xdgOutput);
@@ -581,7 +591,7 @@ CaptureSession::CaptureSession(WaylandCapture *wayland, ext_image_copy_capture_s
     : m_wayland(wayland)
     , m_session(session)
 {
-    connect(wayland, &WaylandCapture::disconnected, this, [this] {
+    m_disconnected = wayland->disconnected.connect([this] {
         if (m_frame)
             ext_image_copy_capture_frame_v1_destroy(m_frame);
         m_frame = nullptr;
@@ -589,7 +599,8 @@ CaptureSession::CaptureSession(WaylandCapture *wayland, ext_image_copy_capture_s
         m_session = nullptr;
         if (!m_stopped) {
             m_stopped = true;
-            Q_EMIT stopped();
+            if (auto callback = onStopped)
+                callback();
         }
     });
 }
@@ -602,19 +613,19 @@ CaptureSession::~CaptureSession()
     m_wayland->flush();
 }
 
-bool CaptureSession::capture(wl_buffer *buffer, const QList<QRect> &damage)
+bool CaptureSession::capture(wl_buffer *buffer, const std::vector<base::Rect> &damage)
 {
     if (!m_session || m_stopped || m_frame || !buffer)
         return false;
     m_frame = ext_image_copy_capture_session_v1_create_frame(m_session);
     ext_image_copy_capture_frame_v1_add_listener(m_frame, &frameListener, this);
     ext_image_copy_capture_frame_v1_attach_buffer(m_frame, buffer);
-    if (damage.isEmpty()) {
+    if (damage.empty()) {
         ext_image_copy_capture_frame_v1_damage_buffer(m_frame, 0, 0, m_size.width(),
                                                       m_size.height());
     } else {
-        for (const QRect &rect : damage) {
-            const QRect clipped = rect.intersected(QRect(QPoint(), m_size));
+        for (const base::Rect &rect : damage) {
+            const base::Rect clipped = rect.intersected(base::Rect(m_size));
             if (!clipped.isEmpty())
                 ext_image_copy_capture_frame_v1_damage_buffer(m_frame, clipped.x(), clipped.y(),
                                                               clipped.width(), clipped.height());

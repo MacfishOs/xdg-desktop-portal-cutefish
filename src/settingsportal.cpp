@@ -1,101 +1,116 @@
 #include "settingsportal.h"
 
-#include <QDBusMessage>
-#include <QDBusPendingCallWatcher>
-#include <QDBusPendingReply>
-#include <QDBusMetaType>
-#include <QDBusServiceWatcher>
-#include <QDebug>
-#include <QSettings>
-#include <QStandardPaths>
+#include "base/logging.h"
+#include "base/settings.h"
+#include "base/strings.h"
+
+#include <systemd/sd-bus.h>
 
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <vector>
 
-static const QString AppearanceService = QStringLiteral("com.cutefish.Services");
-static const QString AppearancePath = QStringLiteral("/com/cutefish/Services/Appearance");
-static const QString AppearanceInterface = QStringLiteral("com.cutefish.Services.Appearance");
-static const QString AppearanceNamespace = QStringLiteral("org.freedesktop.appearance");
-static const QString ColorSchemeKey = QStringLiteral("color-scheme");
+using namespace cutefish;
+using base::dbus::MethodCall;
+using base::dbus::Variant;
+using base::dbus::VariantMap;
 
-static bool matchesNamespace(const QString &pattern)
+static const std::string AppearanceService = "com.cutefish.Services";
+static const std::string AppearancePath = "/com/cutefish/Services/Appearance";
+static const std::string AppearanceInterface = "com.cutefish.Services.Appearance";
+static const std::string AppearanceNamespace = "org.freedesktop.appearance";
+static const std::string ColorSchemeKey = "color-scheme";
+
+static bool matchesNamespace(const std::string &pattern)
 {
-    return pattern.isEmpty() || pattern == QStringLiteral("*") || pattern == AppearanceNamespace
-            || (pattern.endsWith(QStringLiteral(".*"))
-                && AppearanceNamespace.startsWith(pattern.chopped(1)));
+    return pattern.empty() || pattern == "*" || pattern == AppearanceNamespace
+            || (base::strings::endsWith(pattern, ".*")
+                && base::strings::startsWith(AppearanceNamespace, pattern.substr(0, pattern.size() - 1)));
 }
 
-SettingsPortal::SettingsPortal(const QDBusConnection &bus, QObject *parent)
-    : QObject(parent)
-    , m_bus(bus)
+SettingsPortal::SettingsPortal(base::dbus::Connection *bus, const std::string &servicesConfig)
+    : m_bus(bus)
+    , m_object(bus, "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.Settings")
+    , m_appearance(bus, AppearanceService, AppearancePath, AppearanceInterface)
 {
-    qDBusRegisterMetaType<SettingsMap>();
-
-    QSettings settings(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
-                               + QStringLiteral("/cutefish/services.conf"),
-                       QSettings::IniFormat);
-    settings.beginGroup(QStringLiteral("Appearance"));
-    m_colorScheme = settings.value(QStringLiteral("DarkMode"), false).toBool() ? 1u : 2u;
-
-    if (!m_bus.connect(AppearanceService, AppearancePath, AppearanceInterface,
-                       QStringLiteral("darkModeChanged"), this, SLOT(setDarkMode(bool)))) {
-        qWarning() << "Cannot subscribe to Cutefish dark mode changes:" << m_bus.lastError();
+    {
+        const base::Settings settings(servicesConfig);
+        m_colorScheme = settings.boolValue("Appearance/DarkMode", false) ? 1u : 2u;
     }
 
-    auto *watcher = new QDBusServiceWatcher(AppearanceService, m_bus,
-                                            QDBusServiceWatcher::WatchForOwnerChange, this);
-    connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
-            [this](const QString &, const QString &, const QString &newOwner) {
-                if (!newOwner.isEmpty())
-                    refreshAppearance();
-            });
+    m_object.addProperty("version", [this] { return version(); });
+    m_object.addMethod("ReadAll", "as", "a{sa{sv}}", [this](MethodCall &call) { readAll(call); },
+                       {{"namespaces"}, {"value"}});
+    m_object.addMethod("Read", "ss", "v", [this](MethodCall &call) { read(call); }, {{"nameSpace", "key"}, {"value"}});
+    m_object.addSignal("SettingChanged", "ssv", {"nameSpace", "key", "value"});
 
-    refreshAppearance();
+    m_darkModeChanged = m_appearance.onSignal("darkModeChanged", [this](const base::dbus::Message &message) {
+        bool darkMode = false;
+        if (message.read(darkMode))
+            setDarkMode(darkMode);
+    });
+
+    // Called back at once with the current owner, then on every change.
+    m_appearanceOwner = m_bus->watchName(AppearanceService, [this](const std::string &owner) {
+        if (!owner.empty())
+            refreshAppearance();
+    });
 }
 
-SettingsMap SettingsPortal::ReadAll(const QStringList &namespaces) const
+bool SettingsPortal::publish()
 {
-    if (namespaces.isEmpty()
-        || std::any_of(namespaces.cbegin(), namespaces.cend(), matchesNamespace)) {
-        return {{AppearanceNamespace, {{ColorSchemeKey, m_colorScheme}}}};
-    }
-    return {};
+    return m_object.publish();
 }
 
-QDBusVariant SettingsPortal::Read(const QString &nameSpace, const QString &key)
+void SettingsPortal::readAll(MethodCall &call) const
 {
+    std::vector<std::string> namespaces;
+    call.read(namespaces);
+
+    std::map<std::string, VariantMap> result;
+    if (namespaces.empty() || std::any_of(namespaces.cbegin(), namespaces.cend(), matchesNamespace))
+        result[AppearanceNamespace] = {{ColorSchemeKey, Variant(m_colorScheme)}};
+    call.reply(result);
+}
+
+void SettingsPortal::read(MethodCall &call) const
+{
+    std::string nameSpace;
+    std::string key;
+    call.read(nameSpace, key);
+
     if (nameSpace != AppearanceNamespace || key != ColorSchemeKey) {
-        sendErrorReply(QStringLiteral("org.freedesktop.portal.Error.NotFound"),
-                       QStringLiteral("Unknown setting: %1/%2").arg(nameSpace, key));
-        return QDBusVariant(QVariant::fromValue(0u));
+        call.replyError("org.freedesktop.portal.Error.NotFound", "Unknown setting: " + nameSpace + "/" + key);
+        return;
     }
-    return QDBusVariant(QVariant::fromValue(m_colorScheme));
+    call.reply(Variant(m_colorScheme));
 }
 
 void SettingsPortal::setDarkMode(bool darkMode)
 {
-    const uint colorScheme = darkMode ? 1u : 2u;
+    const uint32_t colorScheme = darkMode ? 1u : 2u;
     if (m_colorScheme == colorScheme)
         return;
 
     m_colorScheme = colorScheme;
-    emit SettingChanged(AppearanceNamespace, ColorSchemeKey,
-                        QDBusVariant(QVariant::fromValue(m_colorScheme)));
+    m_object.emitSignal("SettingChanged", AppearanceNamespace, ColorSchemeKey, Variant(m_colorScheme));
 }
 
 void SettingsPortal::refreshAppearance()
 {
-    auto message = QDBusMessage::createMethodCall(AppearanceService, AppearancePath,
-                                                  QStringLiteral("org.freedesktop.DBus.Properties"),
-                                                  QStringLiteral("Get"));
-    message.setArguments({AppearanceInterface, QStringLiteral("isDarkMode")});
-    message.setAutoStartService(false);
+    base::dbus::Message message =
+            m_bus->newMethodCall(AppearanceService, AppearancePath, "org.freedesktop.DBus.Properties", "Get");
+    message.append(AppearanceInterface, std::string("isDarkMode"));
+    sd_bus_message_set_auto_start(message.get(), 0);
 
-    // The live property can be newer than the QSettings file when a change is pending on disk.
-    auto *watcher = new QDBusPendingCallWatcher(m_bus.asyncCall(message, 1000), this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *call) {
-        call->deleteLater();
-        const QDBusPendingReply<QDBusVariant> reply = *call;
-        if (reply.isValid() && reply.value().variant().metaType().id() == QMetaType::Bool)
-            setDarkMode(reply.value().variant().toBool());
-    });
+    // The live property can be newer than the settings file when a change is pending on disk.
+    m_refresh = m_bus->callAsync(
+            message,
+            [this](const base::dbus::Reply &reply) {
+                const std::optional<Variant> value = reply.value<Variant>();
+                if (value && value->signature() == "b")
+                    setDarkMode(value->value<bool>());
+            },
+            std::chrono::milliseconds(1000));
 }

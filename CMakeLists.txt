@@ -1,14 +1,14 @@
 cmake_minimum_required(VERSION 3.18)
 project(xdg-desktop-portal-cutefish VERSION 0.1.0 LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_AUTOMOC ON)
 
 include(GNUInstallDirs)
-find_package(Qt6 REQUIRED COMPONENTS Core DBus)
+find_package(CutefishToolkit REQUIRED)
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(Systemd REQUIRED IMPORTED_TARGET libsystemd)
 pkg_check_modules(PipeWire REQUIRED IMPORTED_TARGET libpipewire-0.3)
 pkg_check_modules(WaylandClient REQUIRED IMPORTED_TARGET wayland-client)
 pkg_check_modules(Gbm REQUIRED IMPORTED_TARGET gbm)
@@ -32,8 +32,8 @@ function(portal_wayland_protocol target name directory)
         ${PROTOCOL_DIR}/${name}-protocol.c ${PROTOCOL_DIR}/${name}-client-protocol.h)
 endfunction()
 
-add_executable(xdg-desktop-portal-cutefish
-    src/main.cpp
+# Everything but main(), so the tests run the portals in their own process.
+add_library(portal-core STATIC
     src/inhibitportal.cpp
     src/inhibitportal.h
     src/settingsportal.cpp
@@ -41,11 +41,12 @@ add_executable(xdg-desktop-portal-cutefish
     src/filechooserportal.cpp
     src/filechooserportal.h
     src/filechoosertypes.h
+    src/options.cpp
+    src/options.h
     src/pipewirecore.cpp
     src/pipewirecore.h
-    src/requesterwatch.h
-    src/requestrouter.cpp
-    src/requestrouter.h
+    src/requestobject.cpp
+    src/requestobject.h
     src/screencastportal.cpp
     src/screencastportal.h
     src/screencaststream.cpp
@@ -54,14 +55,18 @@ add_executable(xdg-desktop-portal-cutefish
     src/waylandcapture.cpp
     src/waylandcapture.h
 )
-portal_wayland_protocol(xdg-desktop-portal-cutefish ext-image-capture-source-v1 staging/ext-image-capture-source)
-portal_wayland_protocol(xdg-desktop-portal-cutefish ext-image-copy-capture-v1 staging/ext-image-copy-capture)
-portal_wayland_protocol(xdg-desktop-portal-cutefish ext-foreign-toplevel-list-v1 staging/ext-foreign-toplevel-list)
-portal_wayland_protocol(xdg-desktop-portal-cutefish xdg-output-unstable-v1 unstable/xdg-output)
-portal_wayland_protocol(xdg-desktop-portal-cutefish linux-dmabuf-v1 stable/linux-dmabuf)
-target_include_directories(xdg-desktop-portal-cutefish PRIVATE ${PROTOCOL_DIR})
-target_link_libraries(xdg-desktop-portal-cutefish PRIVATE Qt6::Core Qt6::DBus
-    PkgConfig::PipeWire PkgConfig::WaylandClient PkgConfig::Gbm PkgConfig::Libdrm)
+portal_wayland_protocol(portal-core ext-image-capture-source-v1 staging/ext-image-capture-source)
+portal_wayland_protocol(portal-core ext-image-copy-capture-v1 staging/ext-image-copy-capture)
+portal_wayland_protocol(portal-core ext-foreign-toplevel-list-v1 staging/ext-foreign-toplevel-list)
+portal_wayland_protocol(portal-core xdg-output-unstable-v1 unstable/xdg-output)
+portal_wayland_protocol(portal-core linux-dmabuf-v1 stable/linux-dmabuf)
+target_include_directories(portal-core PRIVATE ${PROTOCOL_DIR})
+target_include_directories(portal-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(portal-core PUBLIC Cutefish::ToolkitBase PkgConfig::Systemd
+    PRIVATE PkgConfig::PipeWire PkgConfig::WaylandClient PkgConfig::Gbm PkgConfig::Libdrm)
+
+add_executable(xdg-desktop-portal-cutefish src/main.cpp)
+target_link_libraries(xdg-desktop-portal-cutefish PRIVATE portal-core)
 target_compile_definitions(xdg-desktop-portal-cutefish PRIVATE
     PROJECT_VERSION="${PROJECT_VERSION}"
 )
@@ -83,19 +88,5 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/xdg-desktop-portal-cutefish.service
 
 include(CTest)
 if(BUILD_TESTING)
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    find_program(DBUS_RUN_SESSION dbus-run-session REQUIRED)
-    execute_process(COMMAND ${Python3_EXECUTABLE} -c "from gi.repository import Gio, GLib"
-        RESULT_VARIABLE PYTHON_GIO_RESULT ERROR_QUIET)
-    if(NOT PYTHON_GIO_RESULT EQUAL 0)
-        message(FATAL_ERROR "Tests require Python GObject/GIO bindings (python3-gi on Debian). Use -DPython3_EXECUTABLE=/usr/bin/python3 or -DBUILD_TESTING=OFF.")
-    endif()
-    foreach(test settings inhibit screencast)
-        add_test(NAME ${test}-portal
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_session.py
-                ${DBUS_RUN_SESSION} ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${test}.py
-                $<TARGET_FILE:xdg-desktop-portal-cutefish>)
-        set_tests_properties(${test}-portal PROPERTIES TIMEOUT 60)
-    endforeach()
+    add_subdirectory(tests)
 endif()

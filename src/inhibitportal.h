@@ -1,23 +1,29 @@
 #pragma once
 
-#include <QDBusAbstractAdaptor>
-#include <QDBusConnection>
-#include <QDBusMessage>
-#include <QDBusObjectPath>
-#include <QVariantMap>
+#include "base/dbus.h"
 
-class InhibitPortal : public QDBusAbstractAdaptor
+#include <map>
+#include <memory>
+
+class InhibitRequest;
+
+class InhibitPortal
 {
-    Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "org.freedesktop.impl.portal.Inhibit")
-
 public:
-    InhibitPortal(QObject *parent, const QDBusConnection &bus);
+    explicit InhibitPortal(cutefish::base::dbus::Connection *bus);
+    ~InhibitPortal();
 
-public slots:
-    void Inhibit(const QDBusObjectPath &handle, const QString &appId, const QString &window,
-                 uint flags, const QVariantMap &options, const QDBusMessage &message);
+    bool publish();
 
 private:
-    QDBusConnection m_bus;
+    friend class InhibitRequest;
+
+    void inhibit(cutefish::base::dbus::MethodCall &call);
+    // Destroys the request on the next loop turn.
+    void deleteLater(InhibitRequest *request);
+
+    cutefish::base::dbus::Connection *m_bus;
+    cutefish::base::dbus::Object m_object;
+    std::map<InhibitRequest *, std::unique_ptr<InhibitRequest>> m_requests;
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
 };

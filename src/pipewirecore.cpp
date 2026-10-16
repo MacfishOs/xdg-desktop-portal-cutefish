@@ -1,9 +1,13 @@
 #include "pipewirecore.h"
+#include "requestobject.h"
 
-#include <QDebug>
-#include <QSocketNotifier>
+#include "base/event_loop.h"
+#include "base/logging.h"
 
 #include <pipewire/pipewire.h>
+#include <sys/epoll.h>
+
+using namespace cutefish;
 
 static const pw_core_events coreEvents = [] {
     pw_core_events events {};
@@ -11,16 +15,15 @@ static const pw_core_events coreEvents = [] {
     events.error = [](void *data, uint32_t id, int, int result, const char *message) {
         if (id != PW_ID_CORE)
             return;
-        qWarning() << "PipeWire core error" << result << message;
+        CF_WARNING(base::LogCategory::defaultCategory()) << "PipeWire core error" << result << message;
         // The connection is unusable; tear it down outside the callback.
-        auto *core = static_cast<PipeWireCore *>(data);
-        QMetaObject::invokeMethod(core, &PipeWireCore::fail, Qt::QueuedConnection);
+        static_cast<PipeWireCore *>(data)->failLater();
     };
     return events;
 }();
 
-PipeWireCore::PipeWireCore(QObject *parent)
-    : QObject(parent)
+PipeWireCore::PipeWireCore()
+    : m_eventLoop(base::EventLoop::current())
 {
     pw_init(nullptr, nullptr);
 }
@@ -39,15 +42,14 @@ bool PipeWireCore::connectToDaemon()
     m_context = m_loop ? pw_context_new(m_loop, nullptr, 0) : nullptr;
     m_core = m_context ? pw_context_connect(m_context, nullptr, 0) : nullptr;
     if (!m_core) {
-        qWarning() << "Cannot connect to PipeWire for screen casting";
+        CF_WARNING(base::LogCategory::defaultCategory()) << "Cannot connect to PipeWire for screen casting";
         disconnect();
         return false;
     }
     m_listener = new spa_hook {};
     pw_core_add_listener(m_core, m_listener, &coreEvents, this);
     pw_loop_enter(m_loop);
-    m_notifier = new QSocketNotifier(pw_loop_get_fd(m_loop), QSocketNotifier::Read, this);
-    connect(m_notifier, &QSocketNotifier::activated, this, &PipeWireCore::iterate);
+    m_watch = m_eventLoop->watch(pw_loop_get_fd(m_loop), EPOLLIN, [this](uint32_t) { iterate(); });
     return true;
 }
 
@@ -67,16 +69,23 @@ void PipeWireCore::fail()
     if (!m_loop)
         return;
     // Streams destroy themselves against a live core before it goes away.
-    Q_EMIT disconnected();
+    disconnected.emit();
     disconnect();
+}
+
+void PipeWireCore::failLater()
+{
+    later(m_alive, [this] { fail(); });
 }
 
 void PipeWireCore::disconnect()
 {
     if (!m_loop)
         return;
-    delete m_notifier;
-    m_notifier = nullptr;
+    if (m_watch) {
+        m_eventLoop->unwatch(m_watch);
+        m_watch = 0;
+    }
     if (m_listener) {
         spa_hook_remove(m_listener);
         delete m_listener;

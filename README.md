@@ -5,14 +5,18 @@ and ScreenCast.
 
 ## Dependencies
 
+It is built on the base library of
+[cutefish-toolkit](https://github.com/cutefishos/cutefish-toolkit); install it
+first.
+
 ```sh
-sudo apt install cmake ninja-build pkg-config qt6-base-dev libpipewire-0.3-dev \
+sudo apt install cmake ninja-build pkg-config libsystemd-dev libpipewire-0.3-dev \
     libwayland-dev wayland-protocols libgbm-dev libdrm-dev
 ```
 
 At runtime it needs `xdg-desktop-portal`, `xdg-desktop-portal-gtk`, PipeWire,
 cutefish-services and the File Manager daemon (file dialogs). Tests also need
-`dbus-run-session` and `python3-gi`.
+`dbus-run-session` and GoogleTest (`libgtest-dev`).
 
 ## Build
 

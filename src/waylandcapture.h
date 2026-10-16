@@ -1,16 +1,13 @@
 #pragma once
 
-#include <QList>
-#include <QObject>
-#include <QPoint>
-#include <QRect>
-#include <QSize>
-#include <QString>
+#include "base/geometry.h"
+#include "base/signal.h"
 
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <sys/types.h>
 #include <vector>
 
@@ -31,22 +28,24 @@ struct ext_foreign_toplevel_handle_v1;
 struct zwp_linux_dmabuf_v1;
 struct zwp_linux_buffer_params_v1;
 
-class QSocketNotifier;
+namespace cutefish::base {
+class EventLoop;
+}
 
 struct CaptureOutput {
-    QString name;
-    QString description;
-    QPoint logicalPosition;
-    QSize logicalSize;
+    std::string name;
+    std::string description;
+    cutefish::base::Point logicalPosition;
+    cutefish::base::Size logicalSize;
     int refreshMilliHz = 0;
 };
 
 // An application window the compositor lists for capture. The identifier is
 // stable for the window's lifetime and is what a selection names.
 struct CaptureToplevel {
-    QString identifier;
-    QString title;
-    QString appId;
+    std::string identifier;
+    std::string title;
+    std::string appId;
 };
 
 // One plane of a DMA-BUF the portal allocated; the fd stays the caller's.
@@ -58,43 +57,43 @@ struct DmaBufPlane {
 
 class CaptureSession;
 
-// One connection to the compositor for the whole portal, driven from the Qt
-// event loop. It carries output enumeration and the capture globals, which the
+// One connection to the compositor for the whole portal, driven from the
+// portal's event loop. It carries output enumeration and the capture globals, which the
 // compositor only announces to allowlisted executables.
-class WaylandCapture : public QObject
+class WaylandCapture
 {
-    Q_OBJECT
-
 public:
     struct Output;
     struct Toplevel;
 
-    explicit WaylandCapture(QObject *parent = nullptr);
-    ~WaylandCapture() override;
+    WaylandCapture();
+    ~WaylandCapture();
+
+    WaylandCapture(const WaylandCapture &) = delete;
+    WaylandCapture &operator=(const WaylandCapture &) = delete;
 
     // Connects on first use; a broken connection is dropped and retried here.
     bool connectToDisplay();
     bool captureAvailable() const;
 
-    QList<CaptureOutput> outputs() const;
+    std::vector<CaptureOutput> outputs() const;
     // Empty unless the compositor lists windows to this client.
-    QList<CaptureToplevel> toplevels() const;
+    std::vector<CaptureToplevel> toplevels() const;
     bool dmabufAvailable() const { return m_dmabuf != nullptr; }
 
-    std::unique_ptr<CaptureSession> createSession(const QString &output, bool cursor);
-    std::unique_ptr<CaptureSession> createToplevelSession(const QString &identifier, bool cursor);
-    wl_buffer *createShmBuffer(int fd, const QSize &size, int stride);
+    std::unique_ptr<CaptureSession> createSession(const std::string &output, bool cursor);
+    std::unique_ptr<CaptureSession> createToplevelSession(const std::string &identifier, bool cursor);
+    wl_buffer *createShmBuffer(int fd, const cutefish::base::Size &size, int stride);
     // A buffer over planes the caller allocated, delivered to `done` once the
     // compositor has imported it, or as null when it refused. False without
     // linux-dmabuf. A refusal is an event, not a protocol error, which is why
     // this is asynchronous.
-    bool createDmaBufBuffer(const QSize &size, uint32_t format, uint64_t modifier,
+    bool createDmaBufBuffer(const cutefish::base::Size &size, uint32_t format, uint64_t modifier,
                             const std::vector<DmaBufPlane> &planes,
                             std::function<void(wl_buffer *)> done);
     void flush();
 
-Q_SIGNALS:
-    void disconnected();
+    cutefish::base::Signal<> disconnected;
 
 private:
     friend class CaptureSession;
@@ -120,27 +119,30 @@ private:
     ext_foreign_toplevel_list_v1 *m_toplevelList = nullptr;
     ext_image_copy_capture_manager_v1 *m_copies = nullptr;
     zwp_linux_dmabuf_v1 *m_dmabuf = nullptr;
-    QSocketNotifier *m_notifier = nullptr;
+    cutefish::base::EventLoop *m_eventLoop;
+    int m_watch = 0;
     std::vector<std::unique_ptr<Output>> m_outputs;
     std::vector<std::unique_ptr<Toplevel>> m_toplevels;
     bool m_dispatching = false;
     bool m_disconnectPending = false;
     // DMA-BUF imports still waiting for the compositor's created or failed.
     std::vector<zwp_linux_buffer_params_v1 *> m_pendingParams;
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
 };
 
 // One ext-image-copy-capture session on one source. The compositor allows a
 // single frame at a time, so a capture is refused while one is in flight.
-class CaptureSession : public QObject
+class CaptureSession
 {
-    Q_OBJECT
-
 public:
     using DmaBufFormats = std::map<uint32_t, std::vector<uint64_t>>;
 
-    ~CaptureSession() override;
+    ~CaptureSession();
 
-    QSize bufferSize() const { return m_size; }
+    CaptureSession(const CaptureSession &) = delete;
+    CaptureSession &operator=(const CaptureSession &) = delete;
+
+    cutefish::base::Size bufferSize() const { return m_size; }
     bool argbSupported() const { return m_argb; }
     // DRM fourcc to modifiers the compositor renders into, with the device
     // (st_rdev of a DRM node) to allocate on; empty when SHM is all there is.
@@ -150,15 +152,16 @@ public:
 
     // `damage` is what changed in the buffer since it was last filled; empty
     // means all of it.
-    bool capture(wl_buffer *buffer, const QList<QRect> &damage = {});
+    bool capture(wl_buffer *buffer, const std::vector<cutefish::base::Rect> &damage = {});
     void cancel();
 
-Q_SIGNALS:
-    void constraintsChanged();
-    void stopped();
+    // Each may destroy the session.
+    std::function<void()> onConstraintsChanged;
+    std::function<void()> onStopped;
     // `damage` is in buffer coordinates, relative to this session's previous frame.
-    void frameReady(uint64_t presentationNs, uint32_t transform, const QList<QRect> &damage);
-    void frameFailed(uint32_t reason);
+    std::function<void(uint64_t presentationNs, uint32_t transform, const std::vector<cutefish::base::Rect> &damage)>
+            onFrameReady;
+    std::function<void(uint32_t reason)> onFrameFailed;
 
 private:
     friend class WaylandCapture;
@@ -166,10 +169,11 @@ private:
     CaptureSession(WaylandCapture *wayland, ext_image_copy_capture_session_v1 *session);
 
     WaylandCapture *m_wayland;
+    cutefish::base::Subscription m_disconnected;
     ext_image_copy_capture_session_v1 *m_session;
     ext_image_copy_capture_frame_v1 *m_frame = nullptr;
-    QSize m_pendingSize;
-    QSize m_size;
+    cutefish::base::Size m_pendingSize;
+    cutefish::base::Size m_size;
     bool m_pendingArgb = false;
     bool m_argb = false;
     DmaBufFormats m_pendingDmabufFormats;
@@ -179,5 +183,5 @@ private:
     bool m_stopped = false;
     uint32_t m_transform = 0;
     uint64_t m_presentationNs = 0;
-    QList<QRect> m_damage;
+    std::vector<cutefish::base::Rect> m_damage;
 };

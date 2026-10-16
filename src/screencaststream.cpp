@@ -1,14 +1,13 @@
 #include "screencaststream.h"
 
 #include "pipewirecore.h"
+#include "requestobject.h"
 #include "waylandcapture.h"
 
-#include <QDebug>
-#include <QDir>
-#include <QDirIterator>
-#include <QFile>
+#include "base/logging.h"
 
 #include <algorithm>
+#include <dirent.h>
 #include <drm_fourcc.h>
 #include <ext-image-copy-capture-v1-client-protocol.h>
 #include <fcntl.h>
@@ -23,6 +22,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <wayland-client-protocol.h>
+
+using namespace cutefish;
 
 struct ScreenCastStream::Buffer {
     ~Buffer()
@@ -47,7 +48,7 @@ struct ScreenCastStream::Buffer {
     // The bounding box of what changed since this buffer was last filled,
     // for damage_buffer; the compositor paints whole frames, so a box is
     // as good as the exact region here.
-    QRect missed;
+    base::Rect missed;
     bool filled = false;
     // DMA-BUF import is asynchronous; a capture waits for it, a refusal
     // withdraws DMA-BUFs from the stream.
@@ -125,23 +126,29 @@ static uint32_t drmFormat(spa_video_format format)
 }
 
 // The DRM node with this st_rdev, which is what the compositor names.
-static QString drmNodeFor(dev_t device)
+static std::string drmNodeFor(dev_t device)
 {
-    QDirIterator nodes(QStringLiteral("/dev/dri"), QDir::System | QDir::Files);
-    while (nodes.hasNext()) {
-        const QString path = nodes.next();
+    DIR *nodes = opendir("/dev/dri");
+    if (!nodes)
+        return {};
+    std::string result;
+    while (const dirent *entry = readdir(nodes)) {
+        const std::string path = std::string("/dev/dri/") + entry->d_name;
         struct stat info = {};
-        if (stat(QFile::encodeName(path).constData(), &info) == 0 && info.st_rdev == device)
-            return path;
+        if (stat(path.c_str(), &info) == 0 && S_ISCHR(info.st_mode) && info.st_rdev == device) {
+            result = path;
+            break;
+        }
     }
-    return {};
+    closedir(nodes);
+    return result;
 }
 
 // A buffer with exactly this modifier. Some GBM backends (virgl among them)
 // refuse gbm_bo_create_with_modifiers even for LINEAR, while the flag form
 // allocates a linear buffer fine; both forms are tried so the buffer path
 // accepts whatever the modifier probe accepted.
-static gbm_bo *allocateDmaBuf(gbm_device *gbm, const QSize &size, uint32_t format, uint64_t modifier)
+static gbm_bo *allocateDmaBuf(gbm_device *gbm, const base::Size &size, uint32_t format, uint64_t modifier)
 {
     const auto width = uint32_t(size.width());
     const auto height = uint32_t(size.height());
@@ -164,25 +171,23 @@ static gbm_bo *allocateDmaBuf(gbm_device *gbm, const QSize &size, uint32_t forma
 }
 
 ScreenCastStream::ScreenCastStream(WaylandCapture *wayland, PipeWireCore *pipewire,
-                                   const CaptureTarget &target, bool cursor, int maxFramerate,
-                                   QObject *parent)
-    : QObject(parent)
-    , m_wayland(wayland)
+                                   const CaptureTarget &target, bool cursor, int maxFramerate)
+    : m_wayland(wayland)
     , m_pipewire(pipewire)
     , m_target(target)
     , m_cursor(cursor)
     , m_maxFramerate(std::clamp(maxFramerate, 1, 240))
 {
     m_throttle.setSingleShot(true);
-    connect(&m_throttle, &QTimer::timeout, this, &ScreenCastStream::beginCapture);
+    m_throttle.onTimeout = [this] { beginCapture(); };
     // Emitted outside PipeWire callbacks, so the stream can go right away, and
     // it must: the core is destroyed as soon as the signal returns.
-    connect(pipewire, &PipeWireCore::disconnected, this, [this] {
+    m_pipewireDisconnected = pipewire->disconnected.connect([this] {
         destroyStream();
         finish();
     });
     // Likewise the wl_buffers must be destroyed while the display exists.
-    connect(wayland, &WaylandCapture::disconnected, this, [this] {
+    m_waylandDisconnected = wayland->disconnected.connect([this] {
         destroyStream();
         finish();
     });
@@ -221,16 +226,21 @@ bool ScreenCastStream::start()
             : m_wayland->createSession(m_target.name, m_cursor);
     if (!m_session)
         return false;
-    connect(m_session.get(), &CaptureSession::stopped, this, [this] {
+    m_session->onStopped = [this] {
         finish();
-    });
-    connect(m_session.get(), &CaptureSession::frameReady, this, &ScreenCastStream::frameReady);
-    connect(m_session.get(), &CaptureSession::frameFailed, this, &ScreenCastStream::frameFailed);
-    connect(m_session.get(), &CaptureSession::constraintsChanged, this, [this] {
+    };
+    m_session->onFrameReady = [this](uint64_t presentationNs, uint32_t transform,
+                                     const std::vector<base::Rect> &damage) {
+        frameReady(presentationNs, transform, damage);
+    };
+    m_session->onFrameFailed = [this](uint32_t reason) {
+        frameFailed(reason);
+    };
+    m_session->onConstraintsChanged = [this] {
         if (m_finished)
             return;
         if (m_session->bufferSize().isEmpty() || !m_session->argbSupported()) {
-            qWarning() << "Unsupported capture constraints for" << m_target.name;
+            CF_WARNING(base::LogCategory::defaultCategory()) << "Unsupported capture constraints for" << m_target.name;
             finish();
             return;
         }
@@ -242,7 +252,7 @@ bool ScreenCastStream::start()
             m_size = m_session->bufferSize();
             updateParams();
         }
-    });
+    };
     return true;
 }
 
@@ -253,10 +263,10 @@ bool ScreenCastStream::openGbm()
     if (!m_wayland->dmabufAvailable() || !m_session->dmabufDevice()
         || m_session->dmabufFormats().empty())
         return false;
-    const QString node = drmNodeFor(m_session->dmabufDevice());
-    if (node.isEmpty())
+    const std::string node = drmNodeFor(m_session->dmabufDevice());
+    if (node.empty())
         return false;
-    m_gbmFd = open(QFile::encodeName(node).constData(), O_RDWR | O_CLOEXEC);
+    m_gbmFd = open(node.c_str(), O_RDWR | O_CLOEXEC);
     if (m_gbmFd < 0)
         return false;
     m_gbm = gbm_create_device(m_gbmFd);
@@ -335,7 +345,7 @@ bool ScreenCastStream::connectStream()
     openGbm();
     auto *properties = pw_properties_new(PW_KEY_MEDIA_CLASS, "Video/Source", PW_KEY_MEDIA_ROLE,
                                          "Screen", PW_KEY_NODE_NAME, "cutefish-screencast",
-                                         PW_KEY_NODE_DESCRIPTION, qPrintable(m_target.name),
+                                         PW_KEY_NODE_DESCRIPTION, m_target.name.c_str(),
                                          nullptr);
     m_stream = pw_stream_new(m_pipewire->core(), "cutefish-screencast", properties);
     if (!m_stream)
@@ -354,8 +364,8 @@ bool ScreenCastStream::connectStream()
             params.data(), uint32_t(params.size()));
     spa_pod_dynamic_builder_clean(&builder);
     if (result < 0) {
-        qWarning() << "Cannot connect the PipeWire stream for" << m_target.name
-                   << spa_strerror(result);
+        CF_WARNING(base::LogCategory::defaultCategory())
+                << "Cannot connect the PipeWire stream for" << m_target.name << spa_strerror(result);
         return false;
     }
     return true;
@@ -376,7 +386,7 @@ void ScreenCastStream::handleStateChanged(int previous, int state, const char *e
 {
     switch (state) {
     case PW_STREAM_STATE_ERROR:
-        qWarning() << "PipeWire stream error for" << m_target.name << error;
+        CF_WARNING(base::LogCategory::defaultCategory()) << "PipeWire stream error for" << m_target.name << error;
         finish();
         break;
     case PW_STREAM_STATE_UNCONNECTED:
@@ -391,7 +401,8 @@ void ScreenCastStream::handleStateChanged(int previous, int state, const char *e
         if (!m_announced && pw_stream_get_node_id(m_stream) != SPA_ID_INVALID) {
             m_nodeId = pw_stream_get_node_id(m_stream);
             m_announced = true;
-            Q_EMIT ready();
+            if (auto callback = onReady)
+                callback();
         }
         break;
     case PW_STREAM_STATE_STREAMING:
@@ -429,7 +440,7 @@ void ScreenCastStream::handleFormat(const spa_pod *param)
     spa_video_info_raw info {};
     if (spa_format_video_raw_parse(param, &info) < 0)
         return;
-    m_formatSize = QSize(int(info.size.width), int(info.size.height));
+    m_formatSize = base::Size(int(info.size.width), int(info.size.height));
     m_framerate = info.max_framerate.denom > 0
             ? int(info.max_framerate.num / info.max_framerate.denom)
             : 0;
@@ -453,7 +464,8 @@ void ScreenCastStream::handleFormat(const spa_pod *param)
             if (chooseModifier(format, modifiers)) {
                 updateParams(true);
             } else {
-                qWarning() << "No DMA-BUF modifier can be allocated; falling back to memory";
+                CF_WARNING(base::LogCategory::defaultCategory())
+                        << "No DMA-BUF modifier can be allocated; falling back to memory";
                 m_avoidDmaBuf = true;
                 updateParams();
             }
@@ -517,7 +529,8 @@ void ScreenCastStream::addBuffer(pw_buffer *buffer)
         entry->bo = allocateDmaBuf(m_gbm, m_formatSize, m_drmFormat, m_modifier);
         if (!entry->bo) {
             // Withdraw DMA-BUFs and let the renegotiation replace this buffer.
-            qWarning() << "Cannot allocate a DMA-BUF for the stream; falling back to memory";
+            CF_WARNING(base::LogCategory::defaultCategory())
+                    << "Cannot allocate a DMA-BUF for the stream; falling back to memory";
             m_avoidDmaBuf = true;
             m_buffers.push_back(entry.get());
             buffer->user_data = entry.release();
@@ -562,7 +575,8 @@ void ScreenCastStream::addBuffer(pw_buffer *buffer)
                     raw->importPending = false;
                     raw->wlBuffer = imported;
                     if (!imported) {
-                        qWarning() << "The compositor refused a DMA-BUF; falling back to memory";
+                        CF_WARNING(base::LogCategory::defaultCategory())
+                                << "The compositor refused a DMA-BUF; falling back to memory";
                         m_avoidDmaBuf = true;
                         if (m_stream)
                             updateParams();
@@ -632,12 +646,12 @@ void ScreenCastStream::captureNext()
     const int interval = 1000 / std::max(m_framerate, 1);
     if (!m_current) {
         // Every buffer is with the consumer; look again after one frame period.
-        m_throttle.start(interval);
+        m_throttle.start(std::chrono::milliseconds(interval));
         return;
     }
-    const int wait = m_lastCapture.isValid() ? interval - int(m_lastCapture.elapsed()) : 0;
+    const int wait = m_lastCapture.isValid() ? interval - int(m_lastCapture.elapsedMs()) : 0;
     if (wait > 0)
-        m_throttle.start(wait);
+        m_throttle.start(std::chrono::milliseconds(wait));
     else
         beginCapture();
 }
@@ -656,15 +670,15 @@ void ScreenCastStream::beginCapture()
     m_lastCapture.restart();
     // A buffer filled before only needs what it missed since; a fresh one,
     // all of it.
-    QList<QRect> damage;
+    std::vector<base::Rect> damage;
     if (entry && entry->filled)
-        damage.append(entry->missed.isValid() ? entry->missed : QRect(0, 0, 0, 0));
+        damage.push_back(!entry->missed.isEmpty() ? entry->missed : base::Rect(0, 0, 0, 0));
     if (!entry || !entry->wlBuffer || !m_session->capture(entry->wlBuffer, damage))
         returnCurrent();
 }
 
 void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform,
-                                  const QList<QRect> &damage)
+                                  const std::vector<base::Rect> &damage)
 {
     if (!m_current)
         return;
@@ -681,8 +695,8 @@ void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform,
     if (auto *videoTransform = static_cast<spa_meta_videotransform *>(spa_buffer_find_meta_data(
                 buffer, SPA_META_VideoTransform, sizeof(spa_meta_videotransform))))
         videoTransform->transform = transform;
-    QRect changed;
-    for (const QRect &rect : damage)
+    base::Rect changed;
+    for (const base::Rect &rect : damage)
         changed |= rect;
     // Damage since the previous frame, as the compositor tracked it. More
     // rectangles than fit collapse into their bounding box; a zero-sized
@@ -690,10 +704,10 @@ void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform,
     if (spa_meta *meta = spa_buffer_find_meta(buffer, SPA_META_VideoDamage)) {
         auto *region = static_cast<spa_meta_region *>(spa_meta_first(meta));
         const uint32_t capacity = meta->size / sizeof(spa_meta_region);
-        const QList<QRect> rects =
-                uint32_t(damage.size()) > capacity ? QList<QRect> {changed} : damage;
+        const std::vector<base::Rect> rects =
+                uint32_t(damage.size()) > capacity ? std::vector<base::Rect> {changed} : damage;
         uint32_t index = 0;
-        for (const QRect &rect : rects) {
+        for (const base::Rect &rect : rects) {
             region[index].region =
                     SPA_REGION(rect.x(), rect.y(), uint32_t(rect.width()), uint32_t(rect.height()));
             ++index;
@@ -708,7 +722,7 @@ void ScreenCastStream::frameReady(uint64_t presentationNs, uint32_t transform,
             other->missed |= changed;
     }
     if (current) {
-        current->missed = QRect();
+        current->missed = base::Rect();
         current->filled = true;
     }
     buffer->datas[0].chunk->flags = SPA_CHUNK_FLAG_NONE;
@@ -730,13 +744,14 @@ void ScreenCastStream::frameFailed(uint32_t reason)
     // the compositor cannot render into them after all.
     if (m_dmabuf && reason != EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS
         && ++m_failures >= dmabufFailureLimit) {
-        qWarning() << "The compositor keeps failing DMA-BUF captures for" << m_target.name
-                   << "(reason" << reason << "); falling back to memory";
+        CF_WARNING(base::LogCategory::defaultCategory())
+                << "The compositor keeps failing DMA-BUF captures for" << m_target.name << "(reason" << reason
+                << "); falling back to memory";
         m_avoidDmaBuf = true;
         updateParams();
         return;
     }
-    m_throttle.start(1000 / std::max(m_framerate, 1));
+    m_throttle.start(std::chrono::milliseconds(1000 / std::max(m_framerate, 1)));
 }
 
 // Hands an unfilled buffer back for the next dequeue. Queuing it instead
@@ -762,15 +777,10 @@ void ScreenCastStream::finish()
     if (m_session)
         m_session->cancel();
     // Callers may be PipeWire callbacks, where the stream cannot be destroyed.
-    QMetaObject::invokeMethod(
-            this,
-            [this] {
-                destroyStream();
-                m_session.reset();
-                if (m_announced)
-                    Q_EMIT stopped();
-                else
-                    Q_EMIT failed();
-            },
-            Qt::QueuedConnection);
+    later(m_alive, [this] {
+        destroyStream();
+        m_session.reset();
+        if (auto callback = m_announced ? onStopped : onFailed)
+            callback();
+    });
 }

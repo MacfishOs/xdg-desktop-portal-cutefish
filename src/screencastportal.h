@@ -1,50 +1,46 @@
 #pragma once
 
-#include <QDBusAbstractAdaptor>
-#include <QDBusConnection>
-#include <QDBusMessage>
-#include <QDBusObjectPath>
-#include <QHash>
-#include <QVariantMap>
+#include "base/dbus.h"
+
+#include <map>
+#include <memory>
+#include <string>
 
 class PipeWireCore;
 class ScreenCastSession;
+class StartRequest;
 class WaylandCapture;
 
-class ScreenCastPortal : public QDBusAbstractAdaptor
+class ScreenCastPortal
 {
-    Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "org.freedesktop.impl.portal.ScreenCast")
-    Q_PROPERTY(uint version READ version CONSTANT)
-    Q_PROPERTY(uint AvailableSourceTypes READ availableSourceTypes CONSTANT)
-    Q_PROPERTY(uint AvailableCursorModes READ availableCursorModes CONSTANT)
-
 public:
-    ScreenCastPortal(QObject *parent, const QDBusConnection &bus);
-    ~ScreenCastPortal() override;
+    explicit ScreenCastPortal(cutefish::base::dbus::Connection *bus);
+    ~ScreenCastPortal();
 
-    uint version() const { return 4; }
+    bool publish();
+
+    uint32_t version() const { return 4; }
     // Monitors and windows; the compositor exposes no virtual sources.
-    uint availableSourceTypes() const { return 1 | 2; }
+    uint32_t availableSourceTypes() const { return 1 | 2; }
     // Hidden or embedded; cursor metadata is not produced.
-    uint availableCursorModes() const { return 1 | 2; }
-
-public slots:
-    uint CreateSession(const QDBusObjectPath &handle, const QDBusObjectPath &sessionHandle,
-                       const QString &appId, const QVariantMap &options,
-                       const QDBusMessage &message, QVariantMap &results);
-    uint SelectSources(const QDBusObjectPath &handle, const QDBusObjectPath &sessionHandle,
-                       const QString &appId, const QVariantMap &options,
-                       const QDBusMessage &message, QVariantMap &results);
-    uint Start(const QDBusObjectPath &handle, const QDBusObjectPath &sessionHandle,
-               const QString &appId, const QString &parentWindow, const QVariantMap &options,
-               const QDBusMessage &message, QVariantMap &results);
+    uint32_t availableCursorModes() const { return 1 | 2; }
 
 private:
-    ScreenCastSession *session(const QDBusObjectPath &handle, const QDBusMessage &message) const;
+    friend class ScreenCastSession;
+    friend class StartRequest;
 
-    QDBusConnection m_bus;
-    WaylandCapture *m_wayland;
-    PipeWireCore *m_pipewire;
-    QHash<QString, ScreenCastSession *> m_sessions;
+    void createSession(cutefish::base::dbus::MethodCall &call);
+    void selectSources(cutefish::base::dbus::MethodCall &call);
+    void start(cutefish::base::dbus::MethodCall &call);
+    ScreenCastSession *session(const std::string &path, const std::string &sender) const;
+    // Destroys the session on the next loop turn.
+    void deleteLater(ScreenCastSession *session);
+
+    cutefish::base::dbus::Connection *m_bus;
+    cutefish::base::dbus::Object m_object;
+    std::unique_ptr<WaylandCapture> m_wayland;
+    std::unique_ptr<PipeWireCore> m_pipewire;
+    // After the connections they use, so they go first.
+    std::map<std::string, std::unique_ptr<ScreenCastSession>> m_sessions;
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
 };

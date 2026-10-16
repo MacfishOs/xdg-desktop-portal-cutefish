@@ -1,19 +1,21 @@
 #include "filechooserportal.h"
 #include "inhibitportal.h"
-#include "requestrouter.h"
 #include "screencastportal.h"
 #include "settingsportal.h"
 
-#include <QCommandLineParser>
-#include <QCoreApplication>
-#include <QDBusError>
-#include <QDebug>
-#include <QSocketNotifier>
+#include "base/command_line.h"
+#include "base/dbus.h"
+#include "base/event_loop.h"
+#include "base/logging.h"
+#include "base/paths.h"
 
 #include <csignal>
 
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+using namespace cutefish;
 
 static int g_signalFds[2] = {-1, -1};
 
@@ -25,15 +27,14 @@ static void onSignal(int)
 
 // A termination signal ends the event loop instead of the process, so the
 // portals and the leak checker of a sanitizer build get their shutdown.
-static void quitOnSignal(QCoreApplication *app)
+static void quitOnSignal(base::EventLoop &loop)
 {
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, g_signalFds) != 0)
         return;
-    auto *notifier = new QSocketNotifier(g_signalFds[1], QSocketNotifier::Read, app);
-    QObject::connect(notifier, &QSocketNotifier::activated, app, [app] {
+    loop.watch(g_signalFds[1], EPOLLIN, [&loop](uint32_t) {
         char byte;
         (void)!read(g_signalFds[1], &byte, 1);
-        app->quit();
+        loop.quit();
     });
     struct sigaction action = {};
     action.sa_handler = onSignal;
@@ -45,47 +46,42 @@ static void quitOnSignal(QCoreApplication *app)
 
 int main(int argc, char *argv[])
 {
-    QCoreApplication app(argc, argv);
-    quitOnSignal(&app);
-    QCoreApplication::setApplicationName(QStringLiteral("xdg-desktop-portal-cutefish"));
-    QCoreApplication::setApplicationVersion(QStringLiteral(PROJECT_VERSION));
+    base::EventLoop loop;
+    quitOnSignal(loop);
 
-    QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("Cutefish desktop portal backend"));
+    base::CommandLineParser parser;
+    parser.setApplicationDescription("Cutefish desktop portal backend");
+    parser.setApplicationVersion(PROJECT_VERSION);
     parser.addHelpOption();
     parser.addVersionOption();
-    parser.process(app);
+    parser.process(argc, argv);
 
-    auto bus = QDBusConnection::sessionBus();
-    if (!bus.isConnected()) {
-        qCritical() << "Cannot connect to the session bus:" << bus.lastError();
+    base::dbus::Connection *bus = base::dbus::Connection::session(&loop);
+    if (!bus) {
+        CF_CRITICAL(base::LogCategory::defaultCategory()) << "Cannot connect to the session bus";
         return 1;
     }
 
-    bus.connect(QString(), QString(), QStringLiteral("org.freedesktop.DBus.Local"),
-                QStringLiteral("Disconnected"), &app, SLOT(quit()));
+    base::dbus::MatchRule disconnected;
+    disconnected.path = "/org/freedesktop/DBus/Local";
+    disconnected.interface = "org.freedesktop.DBus.Local";
+    disconnected.member = "Disconnected";
+    const base::dbus::Match quitOnDisconnect =
+            bus->subscribe(disconnected, [&loop](const base::dbus::Message &) { loop.quit(); });
 
-    SettingsPortal settings(bus);
-    new InhibitPortal(&settings, bus);
-    new FileChooserPortal(&settings, bus);
-    new ScreenCastPortal(&settings, bus);
-    if (!bus.registerObject(QStringLiteral("/org/freedesktop/portal/desktop"), &settings,
-                            QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals
-                                    | QDBusConnection::ExportAllProperties
-                                    | QDBusConnection::ExportAdaptors)) {
-        qCritical() << "Cannot export the Settings portal:" << bus.lastError();
+    SettingsPortal settings(bus, base::paths::cutefishConfig("services"));
+    InhibitPortal inhibit(bus);
+    FileChooserPortal fileChooser(bus);
+    ScreenCastPortal screenCast(bus);
+    if (!settings.publish() || !inhibit.publish() || !fileChooser.publish() || !screenCast.publish()) {
+        CF_CRITICAL(base::LogCategory::defaultCategory()) << "Cannot export the portals";
         return 1;
     }
 
-    if (!RequestRouter::install(bus)) {
-        qCritical() << "Cannot export the portal requests:" << bus.lastError();
+    if (!bus->requestName("org.freedesktop.impl.portal.desktop.cutefish")) {
+        CF_CRITICAL(base::LogCategory::defaultCategory()) << "Cannot own the Cutefish portal service";
         return 1;
     }
 
-    if (!bus.registerService(QStringLiteral("org.freedesktop.impl.portal.desktop.cutefish"))) {
-        qCritical() << "Cannot own the Cutefish portal service:" << bus.lastError();
-        return 1;
-    }
-
-    return app.exec();
+    return loop.run();
 }

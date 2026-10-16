@@ -1,37 +1,39 @@
 #pragma once
 
-#include <QDBusAbstractAdaptor>
-#include <QDBusConnection>
-#include <QDBusMessage>
-#include <QDBusObjectPath>
-#include <QVariantMap>
+#include "base/dbus.h"
 
-class FileChooserPortal : public QDBusAbstractAdaptor
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+
+class FileChooserRequest;
+
+class FileChooserPortal
 {
-    Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "org.freedesktop.impl.portal.FileChooser")
-    Q_PROPERTY(uint version READ version CONSTANT)
-
 public:
-    FileChooserPortal(QObject *parent, const QDBusConnection &bus);
+    explicit FileChooserPortal(cutefish::base::dbus::Connection *bus);
+    ~FileChooserPortal();
 
-    uint version() const { return 4; }
+    bool publish();
 
-public slots:
-    uint OpenFile(const QDBusObjectPath &handle, const QString &appId, const QString &parentWindow,
-                  const QString &title, const QVariantMap &options, const QDBusMessage &message,
-                  QVariantMap &results);
-    uint SaveFile(const QDBusObjectPath &handle, const QString &appId, const QString &parentWindow,
-                  const QString &title, const QVariantMap &options, const QDBusMessage &message,
-                  QVariantMap &results);
-    uint SaveFiles(const QDBusObjectPath &handle, const QString &appId, const QString &parentWindow,
-                   const QString &title, const QVariantMap &options, const QDBusMessage &message,
-                   QVariantMap &results);
+    uint32_t version() const { return 4; }
 
 private:
-    uint choose(const QString &mode, const QDBusObjectPath &handle, const QString &appId,
-                const QString &parentWindow, const QString &title, const QVariantMap &options,
-                const QDBusMessage &message);
+    friend class FileChooserRequest;
 
-    QDBusConnection m_bus;
+    void choose(const std::string &mode, cutefish::base::dbus::MethodCall &call);
+    // Destroys the request on the next loop turn.
+    void deleteLater(FileChooserRequest *request);
+
+    cutefish::base::dbus::Connection *m_bus;
+    cutefish::base::dbus::Object m_object;
+    std::map<FileChooserRequest *, std::unique_ptr<FileChooserRequest>> m_requests;
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
 };
+
+// A local file: URL as the chooser's answer may hold it, written the way the
+// portal hands URLs on: a lower-case scheme, an empty authority, unreserved
+// characters unescaped and everything outside the URL syntax escaped. Empty
+// for another scheme, a host, or a relative path.
+std::optional<std::string> normalizedFileUrl(std::string_view url);

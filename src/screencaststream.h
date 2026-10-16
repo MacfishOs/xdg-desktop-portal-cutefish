@@ -1,15 +1,14 @@
 #pragma once
 
-#include <QElapsedTimer>
-#include <QList>
-#include <QObject>
-#include <QRect>
-#include <QSize>
-#include <QString>
-#include <QTimer>
+#include "base/elapsed_timer.h"
+#include "base/geometry.h"
+#include "base/signal.h"
+#include "base/timer.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct gbm_device;
@@ -31,33 +30,35 @@ struct CaptureTarget {
         Window,
     };
     Kind kind = Kind::Monitor;
-    QString name;
+    std::string name;
 };
 
 // One capture target exported as a PipeWire video source. Buffers are the
 // consumer's choice: DMA-BUFs the compositor renders into on the GPU when it
 // offers that and the consumer takes them, memfd-backed wl_shm buffers
 // otherwise. A frame is only requested while a buffer is free.
-class ScreenCastStream : public QObject
+class ScreenCastStream
 {
-    Q_OBJECT
-
 public:
     ScreenCastStream(WaylandCapture *wayland, PipeWireCore *pipewire, const CaptureTarget &target,
-                     bool cursor, int maxFramerate, QObject *parent = nullptr);
-    ~ScreenCastStream() override;
+                     bool cursor, int maxFramerate);
+    ~ScreenCastStream();
+
+    ScreenCastStream(const ScreenCastStream &) = delete;
+    ScreenCastStream &operator=(const ScreenCastStream &) = delete;
 
     bool start();
     uint32_t nodeId() const { return m_nodeId; }
-    QSize size() const { return m_size; }
+    cutefish::base::Size size() const { return m_size; }
     const CaptureTarget &target() const { return m_target; }
 
-Q_SIGNALS:
-    // Exactly one of these fires before the node id is known.
-    void ready();
-    void failed();
-    // After ready(): the compositor or PipeWire ended the stream.
-    void stopped();
+    // Exactly one of onReady and onFailed runs before the node id is known.
+    // onReady runs inside a PipeWire callback and must leave the stream be;
+    // the others run from the event loop and may destroy it.
+    std::function<void()> onReady;
+    std::function<void()> onFailed;
+    // After onReady: the compositor or PipeWire ended the stream.
+    std::function<void()> onStopped;
 
 private:
     struct Buffer;
@@ -75,7 +76,7 @@ private:
     void removeBuffer(pw_buffer *buffer);
     void captureNext();
     void beginCapture();
-    void frameReady(uint64_t presentationNs, uint32_t transform, const QList<QRect> &damage);
+    void frameReady(uint64_t presentationNs, uint32_t transform, const std::vector<cutefish::base::Rect> &damage);
     void frameFailed(uint32_t reason);
     void returnCurrent();
     void destroyStream();
@@ -89,9 +90,9 @@ private:
     std::unique_ptr<CaptureSession> m_session;
     pw_stream *m_stream = nullptr;
     spa_hook *m_listener = nullptr;
-    QSize m_size;
+    cutefish::base::Size m_size;
     // The negotiated format's size; buffers follow it, never a newer m_size.
-    QSize m_formatSize;
+    cutefish::base::Size m_formatSize;
     uint32_t m_nodeId = 0;
     bool m_announced = false;
     bool m_streaming = false;
@@ -100,8 +101,8 @@ private:
     uint64_t m_sequence = 0;
     pw_buffer *m_current = nullptr;
     std::vector<Buffer *> m_buffers;
-    QElapsedTimer m_lastCapture;
-    QTimer m_throttle;
+    cutefish::base::ElapsedTimer m_lastCapture;
+    cutefish::base::Timer m_throttle;
     // DMA-BUF negotiation: the device the compositor named, and what the
     // consumer settled on. A failed allocation withdraws the offer.
     int m_gbmFd = -1;
@@ -116,4 +117,7 @@ private:
     // What chooseModifier() settled a DONT_FIXATE choice on.
     uint32_t m_fixateFormat = 0;
     uint64_t m_fixateModifier = 0;
+    cutefish::base::Subscription m_pipewireDisconnected;
+    cutefish::base::Subscription m_waylandDisconnected;
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
 };

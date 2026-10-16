@@ -1,97 +1,18 @@
 #pragma once
 
-#include <QDBusArgument>
-#include <QDBusMetaType>
-#include <QList>
-#include <QString>
+#include <cstdint>
+#include <string>
+#include <tuple>
+#include <vector>
 
-struct FilterRule {
-    uint type;
-    QString value;
-};
+// (us): a glob (0) or MIME type (1) rule.
+using FilterRule = std::tuple<uint32_t, std::string>;
 
-struct FileFilter {
-    QString name;
-    QList<FilterRule> rules;
-};
+// (sa(us)): a named filter.
+using FileFilter = std::tuple<std::string, std::vector<FilterRule>>;
 
-struct ChoiceOption {
-    QString id;
-    QString label;
-};
+// (ss): an option of a choice, or a choice and the option picked.
+using ChoiceOption = std::tuple<std::string, std::string>;
 
-struct FileChoice {
-    QString id;
-    QString label;
-    QList<ChoiceOption> options;
-    QString selected;
-};
-
-Q_DECLARE_METATYPE(FilterRule)
-Q_DECLARE_METATYPE(FileFilter)
-Q_DECLARE_METATYPE(ChoiceOption)
-Q_DECLARE_METATYPE(FileChoice)
-
-inline QDBusArgument &operator<<(QDBusArgument &arg, const FilterRule &value)
-{
-    arg.beginStructure();
-    arg << value.type << value.value;
-    arg.endStructure();
-    return arg;
-}
-
-inline const QDBusArgument &operator>>(const QDBusArgument &arg, FilterRule &value)
-{
-    arg.beginStructure();
-    arg >> value.type >> value.value;
-    arg.endStructure();
-    return arg;
-}
-
-inline QDBusArgument &operator<<(QDBusArgument &arg, const FileFilter &value)
-{
-    arg.beginStructure();
-    arg << value.name << value.rules;
-    arg.endStructure();
-    return arg;
-}
-
-inline const QDBusArgument &operator>>(const QDBusArgument &arg, FileFilter &value)
-{
-    arg.beginStructure();
-    arg >> value.name >> value.rules;
-    arg.endStructure();
-    return arg;
-}
-
-inline QDBusArgument &operator<<(QDBusArgument &arg, const ChoiceOption &value)
-{
-    arg.beginStructure();
-    arg << value.id << value.label;
-    arg.endStructure();
-    return arg;
-}
-
-inline const QDBusArgument &operator>>(const QDBusArgument &arg, ChoiceOption &value)
-{
-    arg.beginStructure();
-    arg >> value.id >> value.label;
-    arg.endStructure();
-    return arg;
-}
-
-inline QDBusArgument &operator<<(QDBusArgument &arg, const FileChoice &value)
-{
-    arg.beginStructure();
-    arg << value.id << value.label << value.options << value.selected;
-    arg.endStructure();
-    return arg;
-}
-
-inline const QDBusArgument &operator>>(const QDBusArgument &arg, FileChoice &value)
-{
-    arg.beginStructure();
-    arg >> value.id >> value.label >> value.options >> value.selected;
-    arg.endStructure();
-    return arg;
-}
+// (ssa(ss)s): id, label, options (none for a check box) and the initial selection.
+using FileChoice = std::tuple<std::string, std::string, std::vector<ChoiceOption>, std::string>;

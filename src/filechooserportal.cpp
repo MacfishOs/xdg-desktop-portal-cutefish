@@ -1,271 +1,398 @@
 #include "filechooserportal.h"
 #include "filechoosertypes.h"
-#include "requesterwatch.h"
-#include "requestrouter.h"
+#include "options.h"
+#include "requestobject.h"
 
-#include <QDBusPendingCallWatcher>
-#include <QDBusPendingReply>
-#include <QDebug>
-#include <QFile>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QUrl>
+#include "base/json.h"
+#include "base/logging.h"
+#include "base/strings.h"
 
-#include <limits>
+#include <systemd/sd-bus.h>
 
-static const QString chooserService = QStringLiteral("com.cutefish.FileChooser");
-static const QString chooserPath = QStringLiteral("/com/cutefish/FileChooser");
+#include <chrono>
+#include <climits>
+#include <cmath>
+#include <tuple>
+#include <vector>
 
-static QJsonObject filterJson(const FileFilter &filter)
+using namespace cutefish;
+using base::dbus::MethodCall;
+using base::dbus::Variant;
+using base::dbus::VariantMap;
+using base::json::Value;
+
+static const std::string chooserService = "com.cutefish.FileChooser";
+static const std::string chooserPath = "/com/cutefish/FileChooser";
+
+static Value filterJson(const FileFilter &filter)
 {
-    QJsonArray rules;
-    for (const auto &rule : filter.rules)
-        rules.append(QJsonObject {{"type", int(rule.type)}, {"value", rule.value}});
-    return {{"name", filter.name}, {"rules", rules}};
+    Value::Array rules;
+    for (const auto &[type, value] : std::get<1>(filter)) {
+        Value rule = Value::object();
+        rule.insert("type", int64_t(type));
+        rule.insert("value", value);
+        rules.push_back(std::move(rule));
+    }
+    Value json = Value::object();
+    json.insert("name", std::get<0>(filter));
+    json.insert("rules", std::move(rules));
+    return json;
 }
 
-static QString localPath(const QVariant &value)
+static std::string localPath(const VariantMap &options, const std::string &key)
 {
-    QByteArray bytes = qdbus_cast<QByteArray>(value);
-    if (bytes.endsWith('\0'))
-        bytes.chop(1);
-    return QFile::decodeName(bytes);
+    const auto it = options.find(key);
+    if (it == options.end())
+        return {};
+    std::string bytes = toBytes(it->second);
+    if (!bytes.empty() && bytes.back() == '\0')
+        bytes.pop_back();
+    return base::strings::sanitizedUtf8(bytes);
 }
 
-class FileChooserRequest : public QObject
+// A whole number that fits an int; the fallback for anything else.
+static int jsonInt(const Value &value, int fallback)
 {
-    Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "org.freedesktop.impl.portal.Request")
+    if (!value.isNumber())
+        return fallback;
+    const double number = value.toDouble();
+    if (number != std::trunc(number) || number < INT_MIN || number > INT_MAX)
+        return fallback;
+    return int(number);
+}
 
+static bool isHex(char c)
+{
+    return base::strings::isAsciiDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static int hexValue(char c)
+{
+    return base::strings::isAsciiDigit(c) ? c - '0' : base::strings::toAsciiLower(c) - 'a' + 10;
+}
+
+static bool isUnreserved(unsigned char c)
+{
+    return base::strings::isAsciiAlpha(char(c)) || base::strings::isAsciiDigit(char(c)) || c == '-' || c == '.'
+            || c == '_' || c == '~';
+}
+
+static void appendEscaped(std::string &out, unsigned char c)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    out += '%';
+    out += digits[c >> 4];
+    out += digits[c & 15];
+}
+
+// Escapes of unreserved characters decoded, other escapes upper-cased, and
+// spaces, controls, non-ASCII bytes and the characters URLs never hold raw
+// escaped.
+static std::string recoded(std::string_view text)
+{
+    std::string out;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const auto c = static_cast<unsigned char>(text[i]);
+        if (c == '%') {
+            if (i + 2 < text.size() && isHex(text[i + 1]) && isHex(text[i + 2])) {
+                const auto decoded = static_cast<unsigned char>(hexValue(text[i + 1]) * 16 + hexValue(text[i + 2]));
+                if (isUnreserved(decoded))
+                    out += char(decoded);
+                else
+                    appendEscaped(out, decoded);
+                i += 2;
+            } else {
+                appendEscaped(out, c);
+            }
+        } else if (c <= 0x20 || c >= 0x7f || std::string_view("<>\"\\^`{|}").find(char(c)) != std::string_view::npos) {
+            appendEscaped(out, c);
+        } else {
+            out += char(c);
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> normalizedFileUrl(std::string_view url)
+{
+    const size_t colon = url.find(':');
+    if (colon == std::string_view::npos || !base::strings::equalsIgnoreAsciiCase(url.substr(0, colon), "file"))
+        return std::nullopt;
+    std::string_view rest = url.substr(colon + 1);
+    if (base::strings::startsWith(rest, "//")) {
+        rest.remove_prefix(2);
+        const size_t end = rest.find_first_of("/?#");
+        if (!rest.empty() && end != 0)
+            return std::nullopt;
+    }
+    const size_t pathEnd = rest.find_first_of("?#");
+    const std::string_view path = rest.substr(0, pathEnd);
+    if (!base::strings::startsWith(path, "/"))
+        return std::nullopt;
+
+    std::string result = "file://" + recoded(path);
+    if (pathEnd != std::string_view::npos) {
+        std::string_view tail = rest.substr(pathEnd);
+        const size_t hash = tail.find('#');
+        if (tail.front() == '?') {
+            result += '?';
+            result += recoded(tail.substr(1, hash == std::string_view::npos ? std::string_view::npos : hash - 1));
+        }
+        if (hash != std::string_view::npos) {
+            result += '#';
+            result += recoded(tail.substr(hash + 1));
+        }
+    }
+    return result;
+}
+
+class FileChooserRequest
+{
 public:
-    FileChooserRequest(const QDBusConnection &bus, const QDBusMessage &message, const QString &path,
-                       QObject *parent)
-        : QObject(parent)
-        , bus(bus)
-        , message(message)
+    FileChooserRequest(FileChooserPortal *portal, const MethodCall &call, const std::string &path)
+        : portal(portal)
+        , bus(portal->m_bus)
+        , call(call)
+        , requester(call.message().sender())
         , path(path)
     {
-        watchRequester(this, bus, message.service(), [this] {
-            finish(1);
-        });
     }
 
-    void start(const QByteArray &payload)
+    bool exportObject()
+    {
+        object = exportRequest(bus, path, [this](MethodCall &close) { Close(close); });
+        if (!object)
+            return false;
+        requesterWatch = watchRequester(bus, requester, [this] { finish(1); });
+        return true;
+    }
+
+    void start(const std::string &payload)
     {
         // The session's file manager daemon shows the dialog; the session
         // restarts it when it dies, so nothing else is started for it.
-        QDBusMessage call = QDBusMessage::createMethodCall(chooserService, chooserPath,
-                                                           chooserService, QStringLiteral("Open"));
-        call << path << QString::fromUtf8(payload);
-        call.setAutoStartService(false);
+        base::dbus::Message open = bus->newMethodCall(chooserService, chooserPath, chooserService, "Open");
+        open.append(path, payload);
+        sd_bus_message_set_auto_start(open.get(), 0);
+        isOpen = true;
         // The dialog stays open as long as the user leaves it.
-        auto *watcher = new QDBusPendingCallWatcher(
-                bus.asyncCall(call, std::numeric_limits<int>::max()), this);
-        open = true;
-        connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher] {
-            watcher->deleteLater();
-            open = false;
-            const QDBusPendingReply<QString> reply = *watcher;
-            if (reply.isError()) {
-                qWarning() << "File Manager chooser failed:" << reply.error().message();
-                finish(2);
-                return;
-            }
-            readResult(reply.value().toUtf8());
-        });
+        pending = bus->callAsync(
+                open,
+                [this](const base::dbus::Reply &reply) {
+                    isOpen = false;
+                    const std::optional<std::string> result = reply.value<std::string>();
+                    if (!result) {
+                        CF_WARNING(base::LogCategory::defaultCategory())
+                                << "File Manager chooser failed:" << reply.error().message;
+                        finish(2);
+                        return;
+                    }
+                    readResult(*result);
+                },
+                std::chrono::milliseconds(INT_MAX));
     }
 
-    void finish(uint response, const QVariantMap &results = {})
+    void finish(uint32_t response, const VariantMap &results = {})
     {
         if (finished)
             return;
         finished = true;
-        if (open) {
-            QDBusMessage close = QDBusMessage::createMethodCall(
-                    chooserService, chooserPath, chooserService, QStringLiteral("Close"));
-            close << path;
-            close.setAutoStartService(false);
-            bus.send(close);
+        if (isOpen) {
+            base::dbus::Message close = bus->newMethodCall(chooserService, chooserPath, chooserService, "Close");
+            close.append(path);
+            sd_bus_message_set_auto_start(close.get(), 0);
+            bus->send(close);
         }
-        RequestRouter::remove(path);
-        bus.send(message.createReply({response, results}));
-        deleteLater();
+        object.reset();
+        call.reply(response, results);
+        portal->deleteLater(this);
     }
 
-public slots:
-
-    void Close(const QDBusMessage &call)
+    void Close(MethodCall &close)
     {
-        if (call.service() != message.service()) {
-            call.setDelayedReply(true);
-            bus.send(call.createErrorReply("org.freedesktop.DBus.Error.AccessDenied",
-                                           "Only the requesting service may close this dialog"));
+        if (close.message().sender() != requester) {
+            close.replyError("org.freedesktop.DBus.Error.AccessDenied",
+                             "Only the requesting service may close this dialog");
             return;
         }
         finish(1);
     }
 
 private:
-    void readResult(const QByteArray &result)
+    void readResult(const std::string &result)
     {
         if (finished)
             return;
-        const auto document = QJsonDocument::fromJson(result);
-        if (result.size() > 1024 * 1024 || !document.isObject()) {
+        const std::optional<Value> document =
+                result.size() > 1024 * 1024 ? std::nullopt : Value::parse(result);
+        if (!document || !document->isObject()) {
             finish(2);
             return;
         }
-        const auto reply = document.object();
-        const int response = reply.value("response").toInt(2);
+        const Value &reply = *document;
+        const int response = jsonInt(reply["response"], 2);
         if (response != 0) {
             finish(response == 1 ? 1 : 2);
             return;
         }
-        QStringList uris;
-        for (const auto &entry : reply.value("uris").toArray()) {
-            const QUrl url(entry.toString());
-            if (!url.isLocalFile() || !url.host().isEmpty() || !url.path().startsWith('/')) {
-                finish(2);
-                return;
+        std::vector<std::string> uris;
+        if (reply["uris"].isArray()) {
+            for (const Value &entry : reply["uris"].toArray()) {
+                const std::optional<std::string> url = normalizedFileUrl(entry.toString());
+                if (!url) {
+                    finish(2);
+                    return;
+                }
+                uris.push_back(*url);
             }
-            uris.append(url.toString(QUrl::FullyEncoded));
         }
-        if (uris.isEmpty() || (single && uris.size() != 1)) {
+        if (uris.empty() || (single && uris.size() != 1)) {
             finish(2);
             return;
         }
-        QVariantMap results {{"uris", uris}};
-        const int filterIndex = reply.value("filter_index").toInt(-1);
-        if (filterIndex >= 0 && filterIndex < filters.size())
-            results.insert("current_filter", QVariant::fromValue(filters.at(filterIndex)));
-        QList<ChoiceOption> selected;
-        const auto values = reply.value("choices").toObject();
-        for (const auto &choice : choices) {
-            const QString value = values.value(choice.id).toString();
-            bool valid = choice.options.isEmpty() && (value == "true" || value == "false");
-            for (const auto &option : choice.options)
-                valid |= option.id == value;
+        VariantMap results{{"uris", Variant(uris)}};
+        const int filterIndex = jsonInt(reply["filter_index"], -1);
+        if (filterIndex >= 0 && size_t(filterIndex) < filters.size())
+            results["current_filter"] = Variant(filters[size_t(filterIndex)]);
+        std::vector<ChoiceOption> selected;
+        const Value &values = reply["choices"];
+        for (const FileChoice &choice : choices) {
+            const std::string &id = std::get<0>(choice);
+            const auto &options = std::get<2>(choice);
+            const std::string value = values.isObject() ? values[id].toString() : std::string();
+            bool valid = options.empty() && (value == "true" || value == "false");
+            for (const auto &option : options)
+                valid |= std::get<0>(option) == value;
             if (!valid) {
                 finish(2);
                 return;
             }
-            selected.append({choice.id, value});
+            selected.emplace_back(id, value);
         }
-        if (!choices.isEmpty())
-            results.insert("choices", QVariant::fromValue(selected));
+        if (!choices.empty())
+            results["choices"] = Variant(selected);
         finish(0, results);
     }
 
 public:
-    QDBusConnection bus;
-    QDBusMessage message;
-    QString path;
-    QList<FileFilter> filters;
-    QList<FileChoice> choices;
+    FileChooserPortal *portal;
+    base::dbus::Connection *bus;
+    MethodCall call;
+    std::string requester;
+    std::string path;
+    std::unique_ptr<base::dbus::Object> object;
+    base::dbus::NameWatch requesterWatch;
+    base::dbus::PendingCall pending;
+    std::vector<FileFilter> filters;
+    std::vector<FileChoice> choices;
     bool single = true;
-    bool open = false;
+    bool isOpen = false;
     bool finished = false;
 };
 
-FileChooserPortal::FileChooserPortal(QObject *parent, const QDBusConnection &bus)
-    : QDBusAbstractAdaptor(parent)
-    , m_bus(bus)
+FileChooserPortal::FileChooserPortal(base::dbus::Connection *bus)
+    : m_bus(bus)
+    , m_object(bus, "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser")
 {
-    qDBusRegisterMetaType<FilterRule>();
-    qDBusRegisterMetaType<QList<FilterRule>>();
-    qDBusRegisterMetaType<FileFilter>();
-    qDBusRegisterMetaType<QList<FileFilter>>();
-    qDBusRegisterMetaType<ChoiceOption>();
-    qDBusRegisterMetaType<QList<ChoiceOption>>();
-    qDBusRegisterMetaType<FileChoice>();
-    qDBusRegisterMetaType<QList<FileChoice>>();
-}
-
-uint FileChooserPortal::OpenFile(const QDBusObjectPath &handle, const QString &appId,
-                                 const QString &parentWindow, const QString &title,
-                                 const QVariantMap &options, const QDBusMessage &message,
-                                 QVariantMap &results)
-{
-    Q_UNUSED(results)
-    return choose("OpenFile", handle, appId, parentWindow, title, options, message);
-}
-
-uint FileChooserPortal::SaveFile(const QDBusObjectPath &handle, const QString &appId,
-                                 const QString &parentWindow, const QString &title,
-                                 const QVariantMap &options, const QDBusMessage &message,
-                                 QVariantMap &results)
-{
-    Q_UNUSED(results)
-    return choose("SaveFile", handle, appId, parentWindow, title, options, message);
-}
-
-uint FileChooserPortal::SaveFiles(const QDBusObjectPath &handle, const QString &appId,
-                                  const QString &parentWindow, const QString &title,
-                                  const QVariantMap &options, const QDBusMessage &message,
-                                  QVariantMap &results)
-{
-    Q_UNUSED(results)
-    return choose("SaveFiles", handle, appId, parentWindow, title, options, message);
-}
-
-uint FileChooserPortal::choose(const QString &mode, const QDBusObjectPath &handle,
-                               const QString &appId, const QString &parentWindow,
-                               const QString &title, const QVariantMap &options,
-                               const QDBusMessage &message)
-{
-    auto *request = new FileChooserRequest(m_bus, message, handle.path(), this);
-    if (!RequestRouter::add(handle.path(), request)) {
-        delete request;
-        return 2;
+    m_object.addProperty("version", [this] { return version(); });
+    const base::dbus::ArgumentNames names {{"handle", "appId", "parentWindow", "title", "options"},
+                                           {"response", "results"}};
+    for (const char *mode : {"OpenFile", "SaveFile", "SaveFiles"}) {
+        m_object.addMethod(
+                mode, "osssa{sv}", "ua{sv}", [this, mode = std::string(mode)](MethodCall &call) { choose(mode, call); },
+                names);
     }
-    message.setDelayedReply(true);
-    const auto preferredFilter = qdbus_cast<FileFilter>(options.value("current_filter"));
-    request->filters = qdbus_cast<QList<FileFilter>>(options.value("filters"));
-    if (request->filters.isEmpty() && options.contains("current_filter"))
-        request->filters.append(preferredFilter);
-    request->choices = qdbus_cast<QList<FileChoice>>(options.value("choices"));
-    request->single =
-            mode == "SaveFile" || (mode == "OpenFile" && !options.value("multiple").toBool());
-    QJsonArray filters;
+}
+
+FileChooserPortal::~FileChooserPortal() = default;
+
+bool FileChooserPortal::publish()
+{
+    return m_object.publish();
+}
+
+void FileChooserPortal::choose(const std::string &mode, MethodCall &call)
+{
+    base::dbus::ObjectPath handle;
+    std::string appId;
+    std::string parentWindow;
+    std::string title;
+    VariantMap options;
+    call.read(handle, appId, parentWindow, title, options);
+
+    auto owned = std::make_unique<FileChooserRequest>(this, call, handle.path);
+    if (!owned->exportObject()) {
+        call.reply(uint32_t(2), VariantMap());
+        return;
+    }
+    FileChooserRequest *request = owned.get();
+    m_requests.emplace(request, std::move(owned));
+
+    const auto option = [&options](const std::string &key) {
+        const auto it = options.find(key);
+        return it == options.end() ? Variant() : it->second;
+    };
+    const FileFilter preferredFilter = option("current_filter").value<FileFilter>();
+    request->filters = option("filters").value<std::vector<FileFilter>>();
+    if (request->filters.empty() && options.count("current_filter"))
+        request->filters.push_back(preferredFilter);
+    request->choices = option("choices").value<std::vector<FileChoice>>();
+    request->single = mode == "SaveFile" || (mode == "OpenFile" && !optionBool(options, "multiple", false));
+
+    Value::Array filters;
     int currentFilter = 0;
-    const auto preferred = filterJson(preferredFilter);
-    for (const auto &filter : request->filters) {
-        const auto json = filterJson(filter);
+    const Value preferred = filterJson(preferredFilter);
+    for (const FileFilter &filter : request->filters) {
+        Value json = filterJson(filter);
         if (json == preferred)
-            currentFilter = filters.size();
-        filters.append(json);
+            currentFilter = int(filters.size());
+        filters.push_back(std::move(json));
     }
-    QJsonArray choices;
-    for (const auto &choice : request->choices) {
-        QJsonArray values;
-        for (const auto &option : choice.options)
-            values.append(QJsonObject {{"id", option.id}, {"label", option.label}});
-        choices.append(QJsonObject {{"id", choice.id},
-                                    {"label", choice.label},
-                                    {"options", values},
-                                    {"selected", choice.selected}});
+    Value::Array choices;
+    for (const FileChoice &choice : request->choices) {
+        Value::Array values;
+        for (const auto &[id, label] : std::get<2>(choice)) {
+            Value value = Value::object();
+            value.insert("id", id);
+            value.insert("label", label);
+            values.push_back(std::move(value));
+        }
+        Value json = Value::object();
+        json.insert("id", std::get<0>(choice));
+        json.insert("label", std::get<1>(choice));
+        json.insert("options", std::move(values));
+        json.insert("selected", std::get<3>(choice));
+        choices.push_back(std::move(json));
     }
-    QJsonArray files;
-    for (const auto &name : qdbus_cast<QList<QByteArray>>(options.value("files")))
-        files.append(localPath(name));
-    const QJsonObject payload {{"mode", mode},
-                               {"title", title},
-                               {"app_id", appId},
-                               {"parent_window", parentWindow},
-                               {"modal", options.value("modal", true).toBool()},
-                               {"multiple", options.value("multiple", false).toBool()},
-                               {"directory", options.value("directory", false).toBool()},
-                               {"accept_label", options.value("accept_label").toString()},
-                               {"current_folder", localPath(options.value("current_folder"))},
-                               {"current_file", localPath(options.value("current_file"))},
-                               {"current_name", options.value("current_name").toString()},
-                               {"filters", filters},
-                               {"filter_index", currentFilter},
-                               {"choices", choices},
-                               {"files", files}};
-    request->start(QJsonDocument(payload).toJson(QJsonDocument::Compact));
-    return 0;
+    Value::Array files;
+    for (const std::vector<uint8_t> &name : option("files").value<std::vector<std::vector<uint8_t>>>()) {
+        std::string bytes(name.begin(), name.end());
+        if (!bytes.empty() && bytes.back() == '\0')
+            bytes.pop_back();
+        files.push_back(base::strings::sanitizedUtf8(bytes));
+    }
+
+    // Keys in alphabetical order, as the chooser has always received them.
+    Value payload = Value::object();
+    payload.insert("accept_label", optionString(options, "accept_label"));
+    payload.insert("app_id", appId);
+    payload.insert("choices", std::move(choices));
+    payload.insert("current_file", localPath(options, "current_file"));
+    payload.insert("current_folder", localPath(options, "current_folder"));
+    payload.insert("current_name", optionString(options, "current_name"));
+    payload.insert("directory", optionBool(options, "directory", false));
+    payload.insert("files", std::move(files));
+    payload.insert("filter_index", currentFilter);
+    payload.insert("filters", std::move(filters));
+    payload.insert("modal", optionBool(options, "modal", true));
+    payload.insert("mode", mode);
+    payload.insert("multiple", optionBool(options, "multiple", false));
+    payload.insert("parent_window", parentWindow);
+    payload.insert("title", title);
+    request->start(payload.serialize());
 }
 
-#include "filechooserportal.moc"
+void FileChooserPortal::deleteLater(FileChooserRequest *request)
+{
+    later(m_alive, [this, request] { m_requests.erase(request); });
+}

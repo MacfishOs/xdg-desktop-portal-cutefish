@@ -1,110 +1,102 @@
 #include "inhibitportal.h"
-#include "requesterwatch.h"
-#include "requestrouter.h"
+#include "options.h"
+#include "requestobject.h"
 
-#include <QDBusPendingCallWatcher>
-#include <QDBusPendingReply>
+#include "base/strings.h"
 
-static void error(const QDBusConnection &bus, const QDBusMessage &message, const QString &name,
-                  const QString &description)
+using namespace cutefish;
+using base::dbus::MethodCall;
+using base::dbus::Reply;
+
+class InhibitRequest
 {
-    message.setDelayedReply(true);
-    bus.send(message.createErrorReply(name, description));
-}
-
-class InhibitRequest : public QObject
-{
-    Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "org.freedesktop.impl.portal.Request")
-
 public:
-    InhibitRequest(QObject *parent, const QDBusConnection &bus, const QDBusMessage &message,
-                   const QString &path)
-        : QObject(parent)
-        , m_bus(bus)
-        , m_message(message)
+    InhibitRequest(InhibitPortal *portal, const MethodCall &call, const std::string &path)
+        : m_portal(portal)
+        , m_bus(portal->m_bus)
+        , m_call(call)
+        , m_requester(call.message().sender())
         , m_path(path)
     {
-        watchRequester(this, bus, message.service(), [this] {
-            close();
-        });
     }
 
-    ~InhibitRequest() override { release(); }
+    ~InhibitRequest() { release(); }
 
-    void start(const QString &appId, const QString &reason)
+    // Exported before the reply, as the frontend may close it at once.
+    bool exportObject()
+    {
+        m_object = exportRequest(m_bus, m_path, [this](MethodCall &call) { Close(call); });
+        if (!m_object)
+            return false;
+        m_requesterWatch = watchRequester(m_bus, m_requester, [this] { close(); });
+        return true;
+    }
+
+    void start(const std::string &appId, const std::string &reason)
     {
         // Asked without blocking, so a busy bus never stalls the other portals; the
         // reply waits for the answer.
-        m_message.setDelayedReply(true);
-        QDBusMessage ownerCall = QDBusMessage::createMethodCall(
-                QStringLiteral("org.freedesktop.DBus"), QStringLiteral("/org/freedesktop/DBus"),
-                QStringLiteral("org.freedesktop.DBus"), QStringLiteral("GetNameOwner"));
-        ownerCall << QStringLiteral("org.freedesktop.ScreenSaver");
-        auto *lookup = new QDBusPendingCallWatcher(m_bus.asyncCall(ownerCall), this);
-        connect(lookup, &QDBusPendingCallWatcher::finished, this,
-                [this, appId, reason](QDBusPendingCallWatcher *call) {
-                    call->deleteLater();
-                    const QDBusPendingReply<QString> owner = *call;
-                    if (m_closed) {
-                        deleteLater();
-                        return;
-                    }
-                    if (owner.isError()) {
-                        m_bus.send(m_message.createErrorReply(
-                                QStringLiteral("org.freedesktop.portal.Error.Failed"),
-                                QStringLiteral("ScreenSaver inhibition service is unavailable")));
-                        RequestRouter::remove(m_path);
-                        deleteLater();
-                        return;
-                    }
-                    m_owner = owner.value();
-                    inhibit(appId, reason);
-                });
+        base::dbus::Message ownerCall = m_bus->newMethodCall("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                             "org.freedesktop.DBus", "GetNameOwner");
+        ownerCall.append(std::string("org.freedesktop.ScreenSaver"));
+        m_lookup = m_bus->callAsync(ownerCall, [this, appId, reason](const Reply &owner) {
+            if (m_closed) {
+                m_portal->deleteLater(this);
+                return;
+            }
+            if (owner.isError() || !owner.value<std::string>()) {
+                m_call.replyError("org.freedesktop.portal.Error.Failed",
+                                  "ScreenSaver inhibition service is unavailable");
+                m_object.reset();
+                m_portal->deleteLater(this);
+                return;
+            }
+            m_owner = *owner.value<std::string>();
+            inhibit(appId, reason);
+        });
     }
 
-public slots:
-
-    void Close(const QDBusMessage &message)
+    void Close(MethodCall &call)
     {
-        if (message.service() != m_message.service()) {
-            error(m_bus, message, QStringLiteral("org.freedesktop.DBus.Error.AccessDenied"),
-                  QStringLiteral("Only the requesting service may close this inhibition"));
+        if (call.message().sender() != m_requester) {
+            call.replyError("org.freedesktop.DBus.Error.AccessDenied",
+                            "Only the requesting service may close this inhibition");
             return;
         }
         close();
     }
 
 private:
-    void inhibit(const QString &appId, const QString &reason)
+    void inhibit(const std::string &appId, const std::string &reason)
     {
-        auto call = QDBusMessage::createMethodCall(
-                m_owner, QStringLiteral("/org/freedesktop/ScreenSaver"),
-                QStringLiteral("org.freedesktop.ScreenSaver"), QStringLiteral("Inhibit"));
-        call.setArguments({appId, reason});
-        auto *pending = new QDBusPendingCallWatcher(m_bus.asyncCall(call), this);
-        connect(pending, &QDBusPendingCallWatcher::finished, this,
-                [this](QDBusPendingCallWatcher *pending) {
-                    QDBusPendingReply<uint> reply = *pending;
-                    m_pending = false;
-                    pending->deleteLater();
-                    if (!reply.isError()) {
-                        m_cookie = reply.value();
-                        m_acquired = true;
-                    }
-                    if (m_closed) {
-                        release();
-                        deleteLater();
-                        return;
-                    }
-                    if (reply.isError()) {
-                        m_bus.send(m_message.createErrorReply(reply.error()));
-                        RequestRouter::remove(m_path);
-                        deleteLater();
-                        return;
-                    }
-                    m_bus.send(m_message.createReply());
-                });
+        base::dbus::Message call = m_bus->newMethodCall(m_owner, "/org/freedesktop/ScreenSaver",
+                                                        "org.freedesktop.ScreenSaver", "Inhibit");
+        call.append(appId, reason);
+        m_inhibit = m_bus->callAsync(call, [this](const Reply &reply) {
+            m_pending = false;
+            const std::optional<uint32_t> cookie = reply.value<uint32_t>();
+            if (cookie) {
+                m_cookie = *cookie;
+                m_acquired = true;
+            }
+            if (m_closed) {
+                release();
+                m_portal->deleteLater(this);
+                return;
+            }
+            if (!cookie) {
+                if (reply.isError())
+                    m_call.replyError(reply.error().name, reply.error().message);
+                else
+                    m_call.replyError("org.freedesktop.DBus.Error.InvalidSignature",
+                                      "Unexpected reply signature: got \"" + reply.message().signature()
+                                              + "\", expected \"u\"");
+                m_object.reset();
+                m_portal->deleteLater(this);
+                return;
+            }
+            m_call.reply();
+        });
     }
 
     void release()
@@ -113,11 +105,10 @@ private:
             return;
         m_acquired = false;
         // Pin the unique owner so a restarted service cannot receive an old cookie.
-        auto call = QDBusMessage::createMethodCall(
-                m_owner, QStringLiteral("/org/freedesktop/ScreenSaver"),
-                QStringLiteral("org.freedesktop.ScreenSaver"), QStringLiteral("UnInhibit"));
-        call.setArguments({m_cookie});
-        m_bus.asyncCall(call);
+        base::dbus::Message call = m_bus->newMethodCall(m_owner, "/org/freedesktop/ScreenSaver",
+                                                        "org.freedesktop.ScreenSaver", "UnInhibit");
+        call.append(m_cookie);
+        m_bus->send(call);
     }
 
     void close()
@@ -125,59 +116,76 @@ private:
         if (m_closed)
             return;
         m_closed = true;
-        RequestRouter::remove(m_path);
+        m_object.reset();
         if (m_pending) {
-            m_bus.send(m_message.createErrorReply(
-                    QStringLiteral("org.freedesktop.portal.Error.Cancelled"),
-                    QStringLiteral("Inhibition was closed")));
-            // Keep the pending call alive to release a cookie returned after Close.
+            m_call.replyError("org.freedesktop.portal.Error.Cancelled", "Inhibition was closed");
+            // Kept alive to release a cookie returned after Close.
             return;
         }
         release();
-        deleteLater();
+        m_portal->deleteLater(this);
     }
 
-    QDBusConnection m_bus;
-    QDBusMessage m_message;
-    QString m_path;
-    QString m_owner;
-    uint m_cookie = 0;
+    InhibitPortal *m_portal;
+    base::dbus::Connection *m_bus;
+    MethodCall m_call;
+    std::string m_requester;
+    std::string m_path;
+    std::string m_owner;
+    std::unique_ptr<base::dbus::Object> m_object;
+    base::dbus::NameWatch m_requesterWatch;
+    base::dbus::PendingCall m_lookup;
+    base::dbus::PendingCall m_inhibit;
+    uint32_t m_cookie = 0;
     bool m_acquired = false;
     bool m_pending = true;
     bool m_closed = false;
 };
 
-InhibitPortal::InhibitPortal(QObject *parent, const QDBusConnection &bus)
-    : QDBusAbstractAdaptor(parent)
-    , m_bus(bus)
+InhibitPortal::InhibitPortal(base::dbus::Connection *bus)
+    : m_bus(bus)
+    , m_object(bus, "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.Inhibit")
 {
+    m_object.addMethod("Inhibit", "ossua{sv}", "", [this](MethodCall &call) { inhibit(call); },
+                       {{"handle", "appId", "window", "flags", "options"}, {}});
 }
 
-void InhibitPortal::Inhibit(const QDBusObjectPath &handle, const QString &appId,
-                            const QString &window, uint flags, const QVariantMap &options,
-                            const QDBusMessage &message)
+InhibitPortal::~InhibitPortal() = default;
+
+bool InhibitPortal::publish()
 {
-    Q_UNUSED(window)
+    return m_object.publish();
+}
+
+void InhibitPortal::inhibit(MethodCall &call)
+{
+    base::dbus::ObjectPath handle;
+    std::string appId;
+    std::string window;
+    uint32_t flags = 0;
+    base::dbus::VariantMap options;
+    call.read(handle, appId, window, flags, options);
+
     // Only the idle bit is honoured; the others ride along, e.g. suspend|idle from players.
     if (!(flags & 8)) {
-        error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.NotSupported"),
-              QStringLiteral("Only idle inhibition (flag 8) is supported"));
+        call.replyError("org.freedesktop.portal.Error.NotSupported", "Only idle inhibition (flag 8) is supported");
         return;
     }
-    if (!handle.path().startsWith(QStringLiteral("/org/freedesktop/portal/desktop/request/"))) {
-        error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.InvalidArgument"),
-              QStringLiteral("Invalid request path"));
+    if (!base::strings::startsWith(handle.path, "/org/freedesktop/portal/desktop/request/")) {
+        call.replyError("org.freedesktop.portal.Error.InvalidArgument", "Invalid request path");
         return;
     }
-    // Exported before the reply, as the frontend may close it at once.
-    auto *request = new InhibitRequest(this, m_bus, message, handle.path());
-    if (!RequestRouter::add(handle.path(), request)) {
-        delete request;
-        error(m_bus, message, QStringLiteral("org.freedesktop.portal.Error.Failed"),
-              QStringLiteral("Cannot export inhibition request"));
+    auto request = std::make_unique<InhibitRequest>(this, call, handle.path);
+    if (!request->exportObject()) {
+        call.replyError("org.freedesktop.portal.Error.Failed", "Cannot export inhibition request");
         return;
     }
-    request->start(appId, options.value(QStringLiteral("reason")).toString());
+    InhibitRequest *raw = request.get();
+    m_requests.emplace(raw, std::move(request));
+    raw->start(appId, optionString(options, "reason"));
 }
 
-#include "inhibitportal.moc"
+void InhibitPortal::deleteLater(InhibitRequest *request)
+{
+    later(m_alive, [this, request] { m_requests.erase(request); });
+}

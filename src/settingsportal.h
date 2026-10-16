@@ -1,40 +1,32 @@
 #pragma once
 
-#include <QDBusConnection>
-#include <QDBusContext>
-#include <QDBusVariant>
-#include <QMap>
-#include <QObject>
-#include <QStringList>
-#include <QVariantMap>
+#include "base/dbus.h"
 
-using SettingsMap = QMap<QString, QVariantMap>;
-Q_DECLARE_METATYPE(SettingsMap)
+#include <cstdint>
+#include <string>
 
-class SettingsPortal : public QObject, protected QDBusContext
+class SettingsPortal
 {
-    Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "org.freedesktop.impl.portal.Settings")
-    Q_PROPERTY(uint version READ version CONSTANT)
-
 public:
-    explicit SettingsPortal(const QDBusConnection &bus, QObject *parent = nullptr);
+    // `servicesConfig` is cutefish-services' settings file, read once for
+    // the dark mode until the live value arrives.
+    SettingsPortal(cutefish::base::dbus::Connection *bus, const std::string &servicesConfig);
 
-    uint version() const { return 1; }
+    bool publish();
 
-public slots:
-    SettingsMap ReadAll(const QStringList &namespaces) const;
-    QDBusVariant Read(const QString &nameSpace, const QString &key);
-
-signals:
-    void SettingChanged(const QString &nameSpace, const QString &key, const QDBusVariant &value);
-
-private slots:
-    void setDarkMode(bool darkMode);
+    uint32_t version() const { return 1; }
 
 private:
+    void readAll(cutefish::base::dbus::MethodCall &call) const;
+    void read(cutefish::base::dbus::MethodCall &call) const;
+    void setDarkMode(bool darkMode);
     void refreshAppearance();
 
-    QDBusConnection m_bus;
-    uint m_colorScheme = 2;
+    cutefish::base::dbus::Connection *m_bus;
+    cutefish::base::dbus::Object m_object;
+    cutefish::base::dbus::Proxy m_appearance;
+    cutefish::base::dbus::Match m_darkModeChanged;
+    cutefish::base::dbus::NameWatch m_appearanceOwner;
+    cutefish::base::dbus::PendingCall m_refresh;
+    uint32_t m_colorScheme = 2;
 };
