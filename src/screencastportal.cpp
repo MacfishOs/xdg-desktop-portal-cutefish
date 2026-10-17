@@ -239,6 +239,8 @@ public:
         if (finished)
             return;
         finished = true;
+        if (session->request == this)
+            session->request = nullptr;
         object.reset();
         call.reply(response, results);
         if (prompting) {
@@ -482,7 +484,7 @@ void ScreenCastPortal::selectSources(MethodCall &call)
     call.read(handle, sessionHandle, appId, options);
 
     ScreenCastSession *session = this->session(sessionHandle.path, call.message().sender());
-    if (!session || session->started) {
+    if (!session || session->started || session->closed || session->request) {
         call.reply(uint32_t(2), VariantMap());
         return;
     }
@@ -513,7 +515,8 @@ void ScreenCastPortal::start(MethodCall &call)
     call.read(handle, sessionHandle, appId, parentWindow, options);
 
     ScreenCastSession *session = this->session(sessionHandle.path, call.message().sender());
-    if (!session || session->started
+    // One Start at a time: a second would leave the first without its reply.
+    if (!session || session->started || session->closed || session->request
         || !base::strings::startsWith(handle.path, "/org/freedesktop/portal/desktop/request/")) {
         call.reply(uint32_t(2), VariantMap());
         return;
