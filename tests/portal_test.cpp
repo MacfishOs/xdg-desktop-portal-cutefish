@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Reion Wong <reionwong@gmail.com>
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: BSD-3-Clause
 
 // The portals on a private session bus, served from this process on its own
 // connection, with mock Cutefish services, ScreenSaver and file chooser.
