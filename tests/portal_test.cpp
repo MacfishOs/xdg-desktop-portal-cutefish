@@ -127,12 +127,12 @@ struct Client
     }
 };
 
-// com.cutefish.Services' appearance object.
+// org.cutefish.Services' appearance object.
 struct AppearanceService
 {
     std::unique_ptr<Connection> connection = openConnection();
-    base::dbus::Object object {connection.get(), "/com/cutefish/Services/Appearance",
-                               "com.cutefish.Services.Appearance"};
+    base::dbus::Object object {connection.get(), "/org/cutefish/Services/Appearance",
+                               "org.cutefish.Services.Appearance"};
     bool dark = false;
 
     AppearanceService()
@@ -145,10 +145,10 @@ struct AppearanceService
     void own(bool value)
     {
         dark = value;
-        EXPECT_TRUE(connection->requestName("com.cutefish.Services"));
+        EXPECT_TRUE(connection->requestName("org.cutefish.Services"));
     }
 
-    void release() { connection->releaseName("com.cutefish.Services"); }
+    void release() { connection->releaseName("org.cutefish.Services"); }
 
     void change(bool value)
     {
@@ -157,11 +157,11 @@ struct AppearanceService
     }
 };
 
-// File Manager's com.cutefish.FileChooser; Open waits without a reply.
+// File Manager's org.cutefish.FileChooser; Open waits without a reply.
 struct ChooserService
 {
     std::unique_ptr<Connection> connection = openConnection();
-    base::dbus::Object object {connection.get(), "/com/cutefish/FileChooser", "com.cutefish.FileChooser"};
+    base::dbus::Object object {connection.get(), "/org/cutefish/FileChooser", "org.cutefish.FileChooser"};
     std::optional<std::string> reply;
     std::vector<std::pair<std::string, std::vector<std::string>>> calls;
     std::vector<MethodCall> pending;
@@ -186,7 +186,7 @@ struct ChooserService
             call.reply();
         });
         object.publish();
-        EXPECT_TRUE(connection->requestName("com.cutefish.FileChooser"));
+        EXPECT_TRUE(connection->requestName("org.cutefish.FileChooser"));
     }
 
     base::json::Value request() const

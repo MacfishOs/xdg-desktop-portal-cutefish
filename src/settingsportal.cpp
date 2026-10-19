@@ -16,9 +16,9 @@ using base::dbus::MethodCall;
 using base::dbus::Variant;
 using base::dbus::VariantMap;
 
-static const std::string AppearanceService = "com.cutefish.Services";
-static const std::string AppearancePath = "/com/cutefish/Services/Appearance";
-static const std::string AppearanceInterface = "com.cutefish.Services.Appearance";
+static const std::string AppearanceService = "org.cutefish.Services";
+static const std::string AppearancePath = "/org/cutefish/Services/Appearance";
+static const std::string AppearanceInterface = "org.cutefish.Services.Appearance";
 static const std::string AppearanceNamespace = "org.freedesktop.appearance";
 static const std::string ColorSchemeKey = "color-scheme";
 

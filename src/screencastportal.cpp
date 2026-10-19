@@ -61,8 +61,8 @@ static const CaptureOutput *findOutput(const std::vector<CaptureOutput> &outputs
 
 static base::dbus::Message permissionsCall(base::dbus::Connection *bus, const std::string &method)
 {
-    return bus->newMethodCall("com.cutefish.Services", "/com/cutefish/Services/Permissions",
-                              "com.cutefish.Services.Permissions", method);
+    return bus->newMethodCall("org.cutefish.Services", "/org/cutefish/Services/Permissions",
+                              "org.cutefish.Services.Permissions", method);
 }
 
 class ScreenCastSession

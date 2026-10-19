@@ -21,8 +21,8 @@ using base::dbus::Variant;
 using base::dbus::VariantMap;
 using base::json::Value;
 
-static const std::string chooserService = "com.cutefish.FileChooser";
-static const std::string chooserPath = "/com/cutefish/FileChooser";
+static const std::string chooserService = "org.cutefish.FileChooser";
+static const std::string chooserPath = "/org/cutefish/FileChooser";
 
 static Value filterJson(const FileFilter &filter)
 {
